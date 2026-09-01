@@ -130,3 +130,42 @@ body {
   color: var(--popup-text);
   font-variant-numeric: tabular-nums;
 }
+
+/* ---------------------------------------------------------------------------
+   Mode toggle (Points / Heatmap)
+
+   The panel chrome is inline in MapView; only the states inline styles cannot
+   express live here — :hover, :focus-visible, and the pressed segment.
+   --------------------------------------------------------------------------- */
+
+.mode-toggle__option {
+  padding: 0.32rem 0.65rem;
+  border: 0;
+  border-radius: 0.35rem;
+  background: transparent;
+  color: var(--popup-label);
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.mode-toggle__option:hover {
+  color: var(--foreground);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* The pressed state is the aria attribute itself, so the accessible name and
+   the visual state cannot drift apart. */
+.mode-toggle__option[aria-pressed="true"] {
+  color: var(--foreground);
+  background: rgba(255, 255, 255, 0.11);
+}
+
+.mode-toggle__option:focus-visible {
+  outline: 2px solid rgba(160, 190, 230, 0.75);
+  outline-offset: 1px;
+}
