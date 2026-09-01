@@ -2,6 +2,16 @@
   --background: #0b0f14;
   --foreground: #e8edf2;
   --muted: #7d8b99;
+
+  /* Popup panel. Opaque, not translucent: the tip is a separate element and
+     any transparency shows as a seam where it meets the panel. Every value
+     below clears WCAG AA against --popup-bg (lowest is the label, at 7.3:1). */
+  --popup-bg: #12141a;
+  --popup-border: rgba(255, 255, 255, 0.12);
+  --popup-heading: #f5f8fb;
+  --popup-text: #eef2f6;
+  --popup-body: #dde5ec;
+  --popup-label: #97a5b3;
 }
 
 * {
@@ -18,4 +28,105 @@ body {
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
     Helvetica, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
+}
+
+/* ---------------------------------------------------------------------------
+   Popup
+
+   mapbox-gl.css is bundled into its own chunk, and Next does not guarantee it
+   lands before this file — so every override here is written one class more
+   specific than the rule it replaces, and wins on specificity rather than on
+   load order. Mapbox's own selectors, for reference:
+     .mapboxgl-popup-content                              (0,1,0)
+     .mapboxgl-popup-anchor-* .mapboxgl-popup-tip         (0,2,0)
+     .mapboxgl-popup-close-button(:hover)                 (0,1,0) / (0,2,0)
+   --------------------------------------------------------------------------- */
+
+.mapboxgl-popup .mapboxgl-popup-content {
+  padding: 0.8rem 2rem 0.85rem 0.9rem;
+  border: 1px solid var(--popup-border);
+  border-radius: 0.6rem;
+  background: var(--popup-bg);
+  color: var(--popup-text);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+}
+
+/* The tip is a CSS triangle: a zero-size box with 10px transparent borders,
+   of which Mapbox colours exactly one side. Colouring more than that side
+   fills the triangle back into a block, so each anchor gets its own rule. */
+.mapboxgl-popup.mapboxgl-popup-anchor-top .mapboxgl-popup-tip,
+.mapboxgl-popup.mapboxgl-popup-anchor-top-left .mapboxgl-popup-tip,
+.mapboxgl-popup.mapboxgl-popup-anchor-top-right .mapboxgl-popup-tip {
+  border-bottom-color: var(--popup-bg);
+}
+
+.mapboxgl-popup.mapboxgl-popup-anchor-bottom .mapboxgl-popup-tip,
+.mapboxgl-popup.mapboxgl-popup-anchor-bottom-left .mapboxgl-popup-tip,
+.mapboxgl-popup.mapboxgl-popup-anchor-bottom-right .mapboxgl-popup-tip {
+  border-top-color: var(--popup-bg);
+}
+
+.mapboxgl-popup.mapboxgl-popup-anchor-left .mapboxgl-popup-tip {
+  border-right-color: var(--popup-bg);
+}
+
+.mapboxgl-popup.mapboxgl-popup-anchor-right .mapboxgl-popup-tip {
+  border-left-color: var(--popup-bg);
+}
+
+/* Mapbox sets no colour on the close button, so it would inherit the browser
+   default black and vanish against the panel. */
+.mapboxgl-popup .mapboxgl-popup-close-button {
+  width: 1.6rem;
+  height: 1.6rem;
+  padding: 0;
+  border-radius: 0 0.6rem 0 0.35rem;
+  color: var(--popup-label);
+  font-size: 1.05rem;
+  line-height: 1;
+  background: transparent;
+}
+
+.mapboxgl-popup .mapboxgl-popup-close-button:hover,
+.mapboxgl-popup .mapboxgl-popup-close-button:focus-visible {
+  color: var(--popup-heading);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.quake-popup__mag {
+  margin: 0;
+  color: var(--popup-heading);
+  font-size: 1.3rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.1;
+}
+
+.quake-popup__place {
+  margin: 0.25rem 0 0.65rem;
+  color: var(--popup-body);
+  font-size: 0.85rem;
+  line-height: 1.35;
+}
+
+.quake-popup__facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.2rem 0.85rem;
+  margin: 0;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--popup-border);
+  font-size: 0.78rem;
+}
+
+.quake-popup__facts dt {
+  color: var(--popup-label);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.quake-popup__facts dd {
+  margin: 0;
+  color: var(--popup-text);
+  font-variant-numeric: tabular-nums;
 }
