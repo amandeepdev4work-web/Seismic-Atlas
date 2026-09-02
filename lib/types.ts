@@ -26,8 +26,12 @@ export type QuakeCollection = FeatureCollection<Point, QuakeProperties>;
 export interface ParseResult {
   /** Rows that survived validation, in feed order. */
   features: QuakeFeature[];
-  /** One readable message per skipped row. */
+  /** One readable message per problem found. */
   errors: string[];
-  /** Length of `errors`, exposed separately for cheap display. */
+  /**
+   * How many data rows were dropped. Normally `errors.length` — the exception
+   * is a fault that belongs to no row (an incomplete column mapping), which is
+   * reported in `errors` but skips nothing, because nothing was read.
+   */
   skippedRows: number;
 }

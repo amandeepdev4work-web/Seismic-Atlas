@@ -3,7 +3,17 @@
 import { useEffect, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import type { GeoJSONSource } from "mapbox-gl";
+import ColumnMapper from "@/components/ColumnMapper";
+import DataPanel, { type Notice } from "@/components/DataPanel";
+import Legend from "@/components/Legend";
 import { APP_NAME } from "@/lib/branding";
+import {
+  detectMapping,
+  guessMapping,
+  readCsvHeaders,
+  type ColumnMapping,
+  type MappingDraft,
+} from "@/lib/columns";
 import { parseQuakeCsv } from "@/lib/csv";
 import {
   HEATMAP_LAYER_ID,
@@ -14,32 +24,54 @@ import {
   QUAKE_SOURCE,
   SAMPLE_CSV_PATH,
   SOURCE_ID,
+  type MapMode,
 } from "@/lib/mapbox";
 import { computeStats, type QuakeStats } from "@/lib/stats";
-import type { QuakeProperties } from "@/lib/types";
+import type { ParseResult, QuakeFeature, QuakeProperties } from "@/lib/types";
+import {
+  checkUploadFile,
+  looksBinary,
+  safeFileName,
+  summarizeErrors,
+  unreadableMessage,
+} from "@/lib/upload";
 
 // Inlined at build time by Next; reading it at module scope keeps the
 // missing-token branch a plain render decision rather than an effect.
 const MAPBOX_TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
 
-type Status =
-  | { phase: "loading" }
-  | { phase: "ready"; plotted: number; skipped: number }
-  | { phase: "error"; message: string };
+/** Where the plotted features came from, and how that reads in the panels. */
+type DataSource =
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | { kind: "sample"; plotted: number }
+  | { kind: "upload"; fileName: string; plotted: number };
 
-/** Which of the two mutually exclusive layers is showing. */
-type Mode = "points" | "heatmap";
+/** A file waiting on the user to say which column is which. */
+type MapperState = {
+  fileName: string;
+  csvText: string;
+  headers: string[];
+  initial: MappingDraft;
+};
 
 export default function MapView() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   // The map instance is a large mutable object — it lives in a ref, never in
   // state, so commanding it imperatively cannot trigger a re-render loop.
   const mapRef = useRef<mapboxgl.Map | null>(null);
-  const [status, setStatus] = useState<Status>({ phase: "loading" });
-  // Both are plain UI state. Neither holds anything the map owns, so neither
+  // The parsed sample, kept so "reset to sample" costs no fetch and no reparse.
+  const sampleRef = useRef<QuakeFeature[] | null>(null);
+
+  // All plain UI state. None of it holds anything the map owns, so none of it
   // can trigger the render loop D3 keeps the map instance out of.
-  const [mode, setMode] = useState<Mode>("points");
+  const [dataSource, setDataSource] = useState<DataSource>({ kind: "loading" });
+  const [layersReady, setLayersReady] = useState(false);
+  const [mode, setMode] = useState<MapMode>("points");
   const [stats, setStats] = useState<QuakeStats | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const [mapper, setMapper] = useState<MapperState | null>(null);
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -59,42 +91,33 @@ export default function MapView() {
     });
 
     map.on("load", () => {
-      void loadQuakes();
+      // The source and both layers are created before any data arrives, and
+      // exactly once. That is what makes an upload independent of the sample
+      // fetch: if the sample 404s there is still a source to setData on.
+      map.addSource(SOURCE_ID, QUAKE_SOURCE);
+      // The heatmap goes on first so the circles draw above it, and starts
+      // hidden — the toggle only ever flips `visibility`.
+      map.addLayer(QUAKE_HEATMAP_LAYER);
+      map.addLayer(QUAKE_CIRCLE_LAYER);
+      wireInteractions(map);
+      if (cancelled) return;
+      setLayersReady(true);
+      void loadSample();
     });
 
-    async function loadQuakes() {
+    async function loadSample() {
       try {
-        const response = await fetch(SAMPLE_CSV_PATH);
-        if (!response.ok) {
-          throw new Error(
-            `${SAMPLE_CSV_PATH} responded ${response.status} ${response.statusText}`,
-          );
-        }
-
-        const { features, errors, skippedRows } = parseQuakeCsv(
-          await response.text(),
-        );
+        const { features, errors, skippedRows } = await fetchSample();
         if (cancelled) return;
 
-        map.addSource(SOURCE_ID, QUAKE_SOURCE);
-        // Both layers read the same source and are added exactly once, here.
-        // The heatmap goes on first so the circles draw above it, and starts
-        // hidden — the toggle only ever flips `visibility`.
-        map.addLayer(QUAKE_HEATMAP_LAYER);
-        map.addLayer(QUAKE_CIRCLE_LAYER);
-
+        sampleRef.current = features;
         const source = map.getSource(SOURCE_ID) as GeoJSONSource | undefined;
         source?.setData({ type: "FeatureCollection", features });
 
-        wireInteractions(map);
         // Computed once, from the same features that were just handed to the
         // source. Nothing recomputes it on toggle.
         setStats(computeStats(features));
-        setStatus({
-          phase: "ready",
-          plotted: features.length,
-          skipped: skippedRows,
-        });
+        setDataSource({ kind: "sample", plotted: features.length });
 
         if (errors.length > 0) {
           console.warn(
@@ -104,10 +127,7 @@ export default function MapView() {
         }
       } catch (error) {
         if (cancelled) return;
-        setStatus({
-          phase: "error",
-          message: error instanceof Error ? error.message : "Unknown error",
-        });
+        setDataSource({ kind: "error", message: describeError(error) });
       }
     }
 
@@ -117,8 +137,6 @@ export default function MapView() {
       mapRef.current = null;
     };
   }, []);
-
-  const layersReady = status.phase === "ready";
 
   // Switching modes is two layout-property flips on layers that already exist
   // and already hold the data — no refetch, no reparse, no setData.
@@ -139,6 +157,182 @@ export default function MapView() {
     );
   }, [mode, layersReady]);
 
+  /**
+   * The one path that changes what is on the map. Uploaded and sample data go
+   * through it identically — same source, same setData — so both layers pick
+   * up new data with no extra wiring (D1/D2).
+   */
+  function showFeatures(
+    features: QuakeFeature[],
+    options: { fit: boolean },
+  ): boolean {
+    const map = mapRef.current;
+    const source = map?.getSource(SOURCE_ID) as GeoJSONSource | undefined;
+    if (!map || !source) return false;
+
+    source.setData({ type: "FeatureCollection", features });
+    setStats(computeStats(features));
+    if (options.fit) fitToFeatures(map, features);
+    return true;
+  }
+
+  /**
+   * Turns a parse result into either new data or a message. Zero valid points
+   * is a refusal, not a load: the previous features stay on the map, because
+   * blanking it would destroy the thing the user was looking at.
+   */
+  function applyParsed(result: ParseResult, fileName: string) {
+    const { features, errors, skippedRows } = result;
+
+    if (features.length === 0) {
+      setNotice({
+        tone: "error",
+        // Every part of this line that came from the file has been through
+        // `safeMessage` — the name when it was picked, the reason here.
+        text: `No usable points in ${fileName}. ${summarizeErrors(errors)} The map still shows the previous data.`,
+      });
+      return;
+    }
+
+    if (!showFeatures(features, { fit: true })) {
+      setNotice({
+        tone: "error",
+        text: "The map is not ready yet — try again in a moment.",
+      });
+      return;
+    }
+
+    setDataSource({ kind: "upload", fileName, plotted: features.length });
+    setNotice({
+      tone: "info",
+      text:
+        skippedRows > 0
+          ? `Loaded ${plural(features.length, "point")} · ${plural(skippedRows, "row")} skipped`
+          : `Loaded ${plural(features.length, "point")}`,
+    });
+
+    if (errors.length > 0) {
+      console.warn(
+        `[Seismic Atlas] skipped ${skippedRows} row(s) in ${fileName}:`,
+        errors,
+      );
+    }
+  }
+
+  async function handleFile(file: File) {
+    setMapper(null);
+    setNotice(null);
+
+    // The name is clamped once, here, and every later message uses this one
+    // rather than `file.name` — nothing off the user's disk reaches the panel
+    // at full length or with control characters in it.
+    const name = safeFileName(file.name);
+
+    // Cheap checks first: a 40 MB zip costs a glance at its name, not a read.
+    const rejection = checkUploadFile(file);
+    if (rejection) {
+      setNotice({ tone: "error", text: rejection });
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const csvText = await file.text();
+
+      // An extension is a claim; these are the bytes. `File.text()` never
+      // throws — it substitutes U+FFFD — so a .csv that is really a zip only
+      // shows up here.
+      if (looksBinary(csvText)) {
+        setNotice({ tone: "error", text: unreadableMessage(file.name) });
+        return;
+      }
+
+      const headers = readCsvHeaders(csvText);
+      if (headers.length === 0) {
+        setNotice({
+          tone: "error",
+          text: `${name} has no readable header row. The map still shows the previous data.`,
+        });
+        return;
+      }
+
+      // USGS-shaped files need no questions asked; anything else gets mapped.
+      const detected = detectMapping(headers);
+      if (detected) {
+        applyParsed(parseQuakeCsv(csvText, detected), name);
+        return;
+      }
+
+      setMapper({
+        fileName: name,
+        csvText,
+        headers,
+        initial: guessMapping(headers),
+      });
+    } catch (error) {
+      // Whatever went wrong reading it, the user's next move is the same, and
+      // the underlying message is not theirs to act on — it goes to the console.
+      console.error(`[Seismic Atlas] could not read ${name}:`, error);
+      setNotice({ tone: "error", text: unreadableMessage(file.name) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** The mapping UI has closed with a choice; parse the file it was holding. */
+  function handleMapping(mapping: ColumnMapping) {
+    if (!mapper) return;
+    const { csvText, fileName } = mapper;
+    setMapper(null);
+    applyParsed(parseQuakeCsv(csvText, mapping), fileName);
+  }
+
+  async function handleReset() {
+    setMapper(null);
+
+    const features = sampleRef.current ?? (await refetchSample());
+    if (!features) return;
+
+    if (!showFeatures(features, { fit: false })) {
+      setNotice({
+        tone: "error",
+        text: "The map is not ready yet — try again in a moment.",
+      });
+      return;
+    }
+
+    // Back to the framing MAP_INIT chose, rather than to the sample's bounds:
+    // the Pacific-centred first frame is the point of the default view (D7).
+    mapRef.current?.easeTo({
+      center: MAP_INIT.center,
+      zoom: MAP_INIT.zoom,
+      duration: 700,
+    });
+    setDataSource({ kind: "sample", plotted: features.length });
+    setNotice({
+      tone: "info",
+      text: `Back to the sample · ${plural(features.length, "point")}`,
+    });
+  }
+
+  /** Only reached if the sample never loaded in the first place. */
+  async function refetchSample(): Promise<QuakeFeature[] | null> {
+    setBusy(true);
+    try {
+      const { features } = await fetchSample();
+      sampleRef.current = features;
+      return features;
+    } catch (error) {
+      setNotice({
+        tone: "error",
+        text: `Could not load the sample — ${describeError(error)}`,
+      });
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }
+
   if (!MAPBOX_TOKEN) {
     return <TokenMissing />;
   }
@@ -146,26 +340,118 @@ export default function MapView() {
   return (
     <main style={styles.root}>
       <div ref={containerRef} style={styles.canvas} />
-      <div style={styles.overlay}>
-        <h1 style={styles.title}>{APP_NAME}</h1>
-        <p style={styles.subtitle}>{describe(status)}</p>
-        {stats && <StatsBar stats={stats} />}
+
+      {/* One grid over the map, two columns pinned to its edges. Grid columns
+          cannot overlap each other however tall or narrow they get, which is
+          the whole reason this is not two absolutely positioned stacks any
+          more. The mapping panel adds a class so the narrow-width rules can
+          make room for it. */}
+      <div className={`map-overlay${mapper ? " map-overlay--mapping" : ""}`}>
+        <div className="map-overlay__stack">
+          <div style={styles.overlay}>
+            <h1 style={styles.title}>{APP_NAME}</h1>
+            <p style={styles.subtitle}>{describe(dataSource)}</p>
+            {stats && <StatsBar stats={stats} />}
+          </div>
+          {layersReady && <Legend mode={mode} />}
+        </div>
+
+        <div className="map-overlay__stack map-overlay__stack--right">
+          {layersReady && (
+            <>
+              <ModeToggle mode={mode} onChange={setMode} />
+              <DataPanel
+                sourceLabel={sourceLabel(dataSource)}
+                busy={busy}
+                canReset={dataSource.kind === "upload"}
+                notice={notice}
+                onFile={(file) => void handleFile(file)}
+                onReset={() => void handleReset()}
+                onDismissNotice={() => setNotice(null)}
+              />
+              {mapper && (
+                <ColumnMapper
+                  // Remounts per file, so the dropdowns reset to the new guess.
+                  key={`${mapper.fileName}:${mapper.headers.join("|")}`}
+                  fileName={mapper.fileName}
+                  headers={mapper.headers}
+                  initial={mapper.initial}
+                  onApply={handleMapping}
+                  onCancel={() => setMapper(null)}
+                />
+              )}
+            </>
+          )}
+        </div>
       </div>
-      {layersReady && <ModeToggle mode={mode} onChange={setMode} />}
     </main>
   );
 }
 
-function describe(status: Status): string {
-  switch (status.phase) {
+async function fetchSample(): Promise<ParseResult> {
+  const response = await fetch(SAMPLE_CSV_PATH);
+  if (!response.ok) {
+    throw new Error(
+      `${SAMPLE_CSV_PATH} responded ${response.status} ${response.statusText}`,
+    );
+  }
+  return parseQuakeCsv(await response.text());
+}
+
+/**
+ * Frames the new data. Uploaded points can sit anywhere — a survey of one
+ * Chilean province would be a few pixels at the edge of the default Pacific
+ * view — so the map goes to them rather than making the user hunt.
+ *
+ * `LngLatBounds` rather than `turf.bbox`: it is the same arithmetic either
+ * way, and this way the client bundle does not gain the turf meta-package for
+ * six lines of it. Turf earns its place in Phase 4, where the geometry is real.
+ */
+function fitToFeatures(map: mapboxgl.Map, features: readonly QuakeFeature[]) {
+  const bounds = new mapboxgl.LngLatBounds();
+
+  for (const feature of features) {
+    const [lng, lat] = feature.geometry.coordinates;
+    if (Number.isFinite(lng) && Number.isFinite(lat)) bounds.extend([lng, lat]);
+  }
+  if (bounds.isEmpty()) return;
+
+  // maxZoom keeps a single point from slamming into street level.
+  map.fitBounds(bounds, { padding: 64, maxZoom: 6, duration: 700 });
+}
+
+/** "1 point", "8 rows" — a notice that says "1 rows" reads like a bug. */
+function plural(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : "Unknown error";
+}
+
+function describe(source: DataSource): string {
+  switch (source.kind) {
     case "loading":
       return "Loading recent earthquakes…";
-    case "ready":
-      return status.skipped > 0
-        ? `${status.plotted} quakes · M4.5+ past month · ${status.skipped} rows skipped`
-        : `${status.plotted} quakes · M4.5+ past month`;
     case "error":
-      return `Could not load quake data — ${status.message}`;
+      return `Could not load quake data — ${source.message}`;
+    case "sample":
+      return `${source.plotted} quakes · M4.5+ past month`;
+    case "upload":
+      return `${source.plotted} quakes · ${source.fileName}`;
+  }
+}
+
+function sourceLabel(source: DataSource): string {
+  switch (source.kind) {
+    case "loading":
+      return "Loading the sample…";
+    case "error":
+      return "No data loaded";
+    case "sample":
+      return "Sample · USGS M4.5+, past month";
+    case "upload":
+      return `Uploaded · ${source.fileName}`;
   }
 }
 
@@ -199,7 +485,7 @@ function formatDepthRange({ minDepth, maxDepth }: QuakeStats): string {
   return `${Math.round(minDepth)}–${Math.round(maxDepth)} km`;
 }
 
-const MODES: ReadonlyArray<{ value: Mode; label: string }> = [
+const MODES: ReadonlyArray<{ value: MapMode; label: string }> = [
   { value: "points", label: "Points" },
   { value: "heatmap", label: "Heatmap" },
 ];
@@ -213,8 +499,8 @@ function ModeToggle({
   mode,
   onChange,
 }: {
-  mode: Mode;
-  onChange: (next: Mode) => void;
+  mode: MapMode;
+  onChange: (next: MapMode) => void;
 }) {
   return (
     <div
@@ -339,11 +625,11 @@ const styles = {
   },
   canvas: { position: "absolute", inset: 0 },
   centered: { display: "flex", alignItems: "center", justifyContent: "center" },
+  // The two stacks and the grid holding them live in globals.css: keeping the
+  // columns from overlapping needs media queries, which inline styles cannot
+  // express. Panel chrome stays here.
   overlay: {
-    position: "absolute",
-    top: "1rem",
-    left: "1rem",
-    zIndex: 1,
+    maxWidth: "100%",
     padding: "0.7rem 1rem",
     borderRadius: "0.6rem",
     border: "1px solid rgba(255, 255, 255, 0.08)",
@@ -363,6 +649,7 @@ const styles = {
     fontSize: "0.78rem",
     letterSpacing: "0.04em",
     color: "var(--muted)",
+    wordBreak: "break-word",
   },
   stats: {
     display: "grid",
@@ -393,10 +680,6 @@ const styles = {
     lineHeight: 1.35,
   },
   toggle: {
-    position: "absolute",
-    top: "1rem",
-    right: "1rem",
-    zIndex: 1,
     display: "flex",
     gap: "0.15rem",
     padding: "0.2rem",
@@ -404,6 +687,7 @@ const styles = {
     border: "1px solid rgba(255, 255, 255, 0.08)",
     background: "rgba(11, 15, 20, 0.72)",
     backdropFilter: "blur(6px)",
+    pointerEvents: "auto",
   },
   notice: { maxWidth: "34rem", padding: "0 1.5rem", textAlign: "center" },
   noticeText: {
@@ -411,5 +695,9 @@ const styles = {
     fontSize: "1rem",
     color: "var(--foreground)",
   },
-  noticeHint: { margin: "0.5rem 0 0", fontSize: "0.85rem", color: "var(--muted)" },
+  noticeHint: {
+    margin: "0.5rem 0 0",
+    fontSize: "0.85rem",
+    color: "var(--muted)",
+  },
 } satisfies Record<string, React.CSSProperties>;

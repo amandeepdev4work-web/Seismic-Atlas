@@ -173,3 +173,50 @@ export const QUAKE_HEATMAP_LAYER: HeatmapLayerSpecification = {
     ],
   },
 };
+
+/** Which of the two mutually exclusive layers is showing. */
+export type MapMode = "points" | "heatmap";
+
+/**
+ * What the legend draws. These mirror the layers above rather than being read
+ * out of them: the layer specs are Mapbox expression arrays whose types resist
+ * being built from shared constants, and the Phase 1 circle layer is not to be
+ * restructured for the sake of a swatch. They sit here, next to the paint
+ * values they describe, so a change to one has the other in view.
+ */
+
+/** Sampled from `QUAKE_CIRCLE_LAYER`'s `circle-color` stops — keep in sync. */
+export const DEPTH_LEGEND_STOPS: ReadonlyArray<{ km: number; color: string }> = [
+  { km: 0, color: "#ffd166" },
+  { km: 35, color: "#f9844a" },
+  { km: 70, color: "#e05780" },
+  { km: 150, color: "#8e7dbe" },
+  { km: 300, color: "#4a8fe7" },
+  { km: 700, color: "#2a4d9b" },
+];
+
+/**
+ * Sampled from `QUAKE_HEATMAP_LAYER`'s `heatmap-color` ramp — keep in sync.
+ * The fully transparent density-0 stop is left out: a legend swatch showing
+ * "nothing" as a colour teaches nothing, and the basemap already says it.
+ */
+export const DENSITY_LEGEND_STOPS: ReadonlyArray<{ at: number; color: string }> = [
+  { at: 0, color: "#7a280e" },
+  { at: 0.2, color: "#8c2f0d" },
+  { at: 0.4, color: "#cf5a12" },
+  { at: 0.6, color: "#ef8b1b" },
+  { at: 0.8, color: "#ffd166" },
+  { at: 1, color: "#fff6de" },
+];
+
+/**
+ * Three magnitudes worth showing a circle for, with the diameter the legend
+ * draws them at. The layer's own radii (3px at M4.5 up to 24px at M8.5) would
+ * put a 48px disc in a corner panel, so these are proportional-but-scaled:
+ * the ratio between them is what the reader takes away, not the absolute size.
+ */
+export const MAGNITUDE_LEGEND_STOPS: ReadonlyArray<{ mag: number; px: number }> = [
+  { mag: 4.5, px: 6 },
+  { mag: 6, px: 13 },
+  { mag: 7.5, px: 22 },
+];
