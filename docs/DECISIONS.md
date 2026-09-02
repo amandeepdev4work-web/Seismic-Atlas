@@ -213,3 +213,78 @@ Upload a file or reset to the sample while a shape is on the map, and the shape 
 It was still rejected, for the reason D18 gives for not blanking the map to report a bad file: the user drew that shape, and destroying their work to reach a state that is easier to describe is the worse failure. A polygon is a question about a region, not a property of a dataset — "how many events are in this box" is a perfectly good question to ask of a second file, and asking it is one of the more interesting things this tool can do. A count of zero is the honest answer when the answer is zero, and "Clear" is one click away, whereas a shape deleted on the user's behalf costs them the whole drawing.
 
 So the recount hangs off `showFeatures`, the single path through which anything reaches the source (D19), which means it covers upload, reset and any future data path for free rather than being remembered at three call sites.
+
+## D30 — Live refresh is paused by the *data source*, and nothing else decides it
+The rule is one sentence: **a refresh must never overwrite data the user brought.** What makes it hold is that there is only one thing that can answer "is the feed what is on the map?", and it is `dataSource` — the discriminated union that already existed to label the panels. `isLive(source)` is `source.kind !== "upload"`, written once, and every consumer reads it.
+
+The alternative was a second piece of state, a `feedMode: "live" | "uploaded"` set alongside `dataSource` at each call site. It was rejected for the ordinary reason: two facts that must agree and are written separately will eventually disagree, and the failure mode here is the one thing this feature must never do — a timer firing while an upload is displayed and silently replacing 40,000 rows of somebody's survey with the USGS feed.
+
+The pause is then structural rather than checked. The timer lives in an effect whose dependencies are `[layersReady, live]`, so uploading a file does not make the interval decline to act — it makes React tear the interval down. There is no timer left to go wrong. Resetting to the sample flips `live` back and a fresh interval starts. `loading` and `error` count as live because they are states of the feed itself, and a refresh from `error` is a retry, which is the most useful thing the button can do at that moment.
+
+Two guards survive underneath that, because a fetch already in flight is not covered by tearing down a timer:
+
+- **`refreshLive` re-checks after every `await`.** A fetch that started while the sample was showing can return after the user has uploaded a file, and at that moment the right thing to do with a perfectly good response is to throw it away.
+- **The check reads a ref, not the render's value.** `liveRef` is written *synchronously* inside `applyDataSource`, the single path that changes `dataSource`, rather than being mirrored in an effect. An effect runs after the render that would have told it, and the reader that matters here — a continuation resuming mid-`await` — can arrive in between. This is the same reason `drawingRef` exists for the popup handler (D26).
+
+The manual button is **hidden** while an upload is displayed rather than disabled. A disabled control asks the reader to work out why; the space it would have occupied says it instead — "Auto-refresh paused while your file is shown."
+
+## D31 — The refresh control extends the data panel, and the first live fetch is not on page load
+Two smaller calls that both come from the same place: the corner budget, which has been the binding constraint on this layout since Phase 2.
+
+**The control joins the data panel** rather than claiming a fifth panel in the right-hand stack. The panel already names where the data came from, and "and it updated 40 seconds ago" is the same sentence continued — a `Refresh` pill beside `Upload CSV` in the row that already exists, and one quiet status line under the source label. Nothing new is pinned to the map. This is the guardrail Phase 4 carried forward, honoured as written.
+
+**There is no fetch on mount.** The page still opens on the bundled sample: it is instant, it does not depend on USGS being reachable, and it is the same first frame this app has always had. Replacing it two seconds later with a near-identical set of points would read as a flicker rather than as news — the delta between the snapshot and the live feed is a couple of dozen events out of six hundred. So the first live data lands on the first timer tick, or immediately if the reader presses Refresh. The status line says which state it is in ("Live · refreshes every 60s" before the first fetch, "Updated 42s ago" after).
+
+The status is also why the elapsed clock is its own component with its own interval. A `now` ticking in `MapView` would re-render the legend, the toggle, the selection panel and the mapper once a second for the sake of two characters; in `ElapsedSince` the once-a-second render is a single line of text.
+
+**A failed refresh keeps the data and says one line.** This is D18's rule applied to a source that fails on its own schedule: the map is never blanked to prove that something went wrong. The timer is untouched by a failure — a thrown fetch does not stop the interval, and the next tick simply tries again — and a later success clears the error notice, because that notice ends "still showing the last data that loaded" and newer data has just landed.
+
+## D32 — A quake's identity is when, where and how big — not the USGS event id
+The live feed carries a catalogue id (`us7000tdjg`). The diff does not use it. `quakeKey` is `time|longitude|latitude|mag`.
+
+The reason is the comparison that has to work first. The CSV parser keeps four properties and an id is not among them, and its row rules are not being changed to add one — so an id-based key exists on exactly one of the two paths data can reach this map by, and could never compare a live fetch against the sample the page opens with, or against an uploaded file. A key that only works on one path is not an identity, it is a coincidence.
+
+Time to the millisecond, position and magnitude identify an event as well as its catalogue number does, and identify it the *same way on both paths* — which is the property being bought. It only holds because the adapter reconstructs the exact string the CSV feed writes: USGS GeoJSON gives `time` as epoch milliseconds, `new Date(ms).toISOString()` gives `2026-09-01T19:21:23.337Z`, and that is character-for-character what the CSV column contains. That conversion is the load-bearing line in `parseQuakeGeojson`, and it has a test pointed straight at it.
+
+Measured against real data rather than argued: of 631 events in the live feed, **606 matched sample-CSV features exactly by key** — the 25 that did not had arrived since the snapshot was taken, and 13 sample events had rolled off the month window. Two back-to-back fetches of the live feed produced **zero** spurious deltas, which is the failure that would have mattered most: a key that jittered between fetches would pulse the whole map every minute.
+
+The cost of the choice: USGS revises events, and a revision that moves the magnitude or the epicentre reads here as a new quake. It is uncommon, it is genuinely a change to what the map is drawing, and the penalty for being wrong about it is one extra ring fading out over four seconds.
+
+## D33 — No previous fetch means nothing is new, and the baseline is the last *live* fetch
+Two rules, and they only make sense together.
+
+**`findNewQuakes(null | undefined | empty set, features)` returns nothing.** The other reading is just as defensible in the abstract — an empty history could mean every event is unseen — and it would flash all 619 points the moment the page opened, which is the exact failure this feature exists not to be. The narrow cost of the rule chosen is that if a fetch ever legitimately returned zero events, the arrivals in the *next* one would not pulse. That is one missed pulse against a guaranteed wall of them. A pulse is an attention signal; it should under-fire rather than over-fire.
+
+**The baseline is `liveKeysRef` — the keys of the last successful live fetch — not the keys of whatever is on the map.** This is the subtler half, and the headless numbers above are what forced it. Diffing against what is displayed sounds more natural and is wrong in a way that only shows up on real data: the bundled sample is a point-in-time snapshot of a rolling month feed, so the first auto-refresh after page load would have found **25 genuine arrivals at once** and rung all of them simultaneously — and that gap grows every day the snapshot is not refreshed. The same thing would happen again after every "Reset to sample".
+
+Anchoring on the last live fetch makes the whole thing one rule with no special cases. `liveKeysRef` starts `null`, so the *first* live fetch pulses nothing whatever it contains — it is the handoff from a static snapshot to a live feed, not a delta. Uploading a file and resetting do not touch it, so the next refresh after a reset correctly reports what has arrived since the feed last answered. Every pulse after that is a genuine sixty-second delta, which in this feed is normally zero, one or two events.
+
+The diff itself is a set membership test and costs nothing worth measuring: 0.35 ms per diff over 631 features, plus 0.25 ms to build the next key set, once a minute.
+
+## D34 — The pulse animates paint properties on its own layer, and its radius is deliberately not magnitude-scaled
+The pulse is a fourth source and a fifth layer, added above the others and holding only the quakes that arrived in the last refresh. Nothing below it is repainted, filtered or re-fed to make it work — the same additive shape as the Phase 4 selection ring (D25), for the same reason.
+
+**Per frame it writes three numbers, never data.** `setData` on the pulse source happens once, when a cohort starts; the four seconds after that move `circle-radius`, `circle-stroke-width` and `circle-stroke-opacity`. Animating by re-feeding the quake source would have put a worker round trip and a re-tile of six hundred points into every frame, and would have done it on the one source the circle layer, the heatmap and the polygon count all read.
+
+**The radius is a flat number, not a magnitude interpolation, and that is the point.** Magnitude is already the circle's own radius; a pulse that scaled with it would say the same thing twice. More concretely, it would drag this layer into the keep-in-sync obligation D20 and D25 carry — Phase 4 carried forward an explicit warning that a pulse touching `circle-radius` would pull `MAGNITUDE_LEGEND_STOPS` and the selection ring's radii along with it. A pulse means "this one is new" and nothing else, so it does not have to know what the circle under it is doing. It runs 5px → 30px, which clears even an M8.5 disc (24px) by the end.
+
+**One cohort at a time is what stops pulses accumulating.** A refresh replaces whatever was pulsing rather than merging into it, so there is one start time and the loop animates three scalars however many rings are on screen; a cohort four seconds old is gone whether or not a new one arrived. `showFeatures` also ends a running pulse, because those rings were computed against a feature set that is no longer on the map.
+
+**Colour:** `#ffd166`, the palette's shallow-depth amber and already the one colour shared between the circle layer and the heatmap ramp. Warm, and clearly not the neutral white that means "selected" (D25) — the two can be on screen together and must not read as the same claim.
+
+**In Heatmap mode the pulse is hidden, and is not started at all.** D25's argument transfers unchanged: a ring drawn around one quake is a claim about an individual point, and a heatmap deliberately has none — the arrival is already in the density. The mode effect is the *only* owner of the layer's visibility, and the animation is the only owner of its content, so neither has to know about the other. Switching to Heatmap mid-pulse ends it; switching back does not resurrect it, because a pulse is an announcement and the moment to hear it has passed.
+
+**Under `prefers-reduced-motion` the ring does not travel.** It is held at the size it would have settled at and only the opacity runs. A fade is not the kind of movement that setting is about, and dropping the pulse entirely would take the signal away from readers who asked for calm rather than for silence.
+
+## D35 — One animation loop, and it does not exist when nothing is pulsing
+This map already runs a per-frame polygon recount (D28), a circle layer, a heatmap and a highlight ring. The pulse adds exactly one `requestAnimationFrame` loop and holds exactly one handle, `frameRef`.
+
+**It is not a ticker.** `stopPulse` does not schedule another frame, so between pulses this component holds no rAF at all and costs the browser nothing — which is the whole of "pause when idle". The loop starts when a cohort starts and ends when the last frame of that cohort is painted.
+
+**It cannot fight the polygon recount.** The two never drive each other, and the reason is in Draw's plumbing, which Phase 4 read rather than assumed: `draw.render` is fired from `store.render()`, which is called from `mode_handler.delegate` — i.e. only when a Draw mode actually handles an event. It is not fired by map repaints, so a `setPaintProperty` at 60fps produces no Draw events. In the other direction, the pulse writes only to `quakes-pulse`, which nothing in Draw reads. Worst case the two overlap — a vertex being dragged during the four seconds after a refresh — and the frame does a set-membership recount (0.2 ms, D28) plus three scalar paint writes.
+
+**The frame is cancelled in the effect cleanup, unconditionally and before `map.remove()`.** A queued frame would otherwise fire against a torn-down map, which is the same hazard `drawRef` is dropped for.
+
+Two details worth knowing. `requestAnimationFrame`'s timestamp is on the same clock `performance.now()` reads, so elapsed time is exact and the animation does not drift with the frame rate. And a background tab runs no animation frames at all, so a pulse started just before the tab was hidden simply freezes and then, on return, finds itself past its end time and stops — which is the correct behaviour for an announcement nobody was there to see.
+
+Frame zero is painted synchronously in `startPulse` rather than waited for, because the paint properties are still sitting where the previous cohort's last frame left them — a wide, all-but-invisible ring — and without it the first thing drawn would be the end of the last animation instead of the start of this one.

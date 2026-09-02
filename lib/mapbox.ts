@@ -384,3 +384,92 @@ export const DRAW_STYLES: DrawStyle[] = [
     },
   },
 ];
+
+/* ---------------------------------------------------------------------------
+   Phase 5 — the arrival pulse
+
+   Additive again: a fourth source and a fifth layer, above the others, holding
+   only the quakes that were absent from the previous live fetch. Nothing above
+   this line moves — in particular the circle layer's radii do not, which is
+   what keeps D20's and D25's keep-in-sync obligations off this feature (see
+   the note on the radii below, and docs/DECISIONS.md D34).
+   --------------------------------------------------------------------------- */
+
+/** id of the source holding the quakes that arrived in the last refresh. */
+export const PULSE_SOURCE_ID = "quakes-pulse";
+/** id of the expanding ring layer drawn from {@link PULSE_SOURCE_ID}. */
+export const PULSE_LAYER_ID = "quakes-pulse-ring";
+
+/** How long one ring takes to expand and fade out. */
+export const PULSE_DURATION_MS = 4000;
+
+/** The ring's radius at the start and end of its life, in pixels. */
+const PULSE_MIN_RADIUS = 5;
+const PULSE_MAX_RADIUS = 30;
+
+/** Empty except during the four seconds after a refresh brought something. */
+export const QUAKE_PULSE_SOURCE: GeoJSONSourceSpecification = {
+  type: "geojson",
+  data: EMPTY_COLLECTION,
+};
+
+/**
+ * One soft ring per newly arrived quake, drawn above every other data layer.
+ *
+ * The paint values here are only the resting state — the animation drives
+ * `circle-radius`, `circle-stroke-width` and `circle-stroke-opacity` per frame
+ * through {@link pulseFrame}. It starts fully transparent so that a layer with
+ * no live animation behind it draws nothing at all, whatever is in its source.
+ *
+ * The radius is a **flat number, not a magnitude interpolation**, and that is
+ * the point. Magnitude is already the circle's own radius; a pulse that also
+ * scaled with magnitude would say the same thing twice and, worse, would put
+ * this layer under the keep-in-sync obligation D20 and D25 carry — the
+ * carried-forward note from Phase 4 warned that a pulse touching
+ * `circle-radius` would drag `MAGNITUDE_LEGEND_STOPS` and the selection ring's
+ * radii along with it. A pulse means "this one is new", nothing else, so it
+ * does not have to know what the circle under it is doing, and the ring
+ * expands past even an M8.5 disc (24px) by the end of its run.
+ *
+ * `#ffd166` is the palette's shallow-depth amber, already the one colour
+ * shared between the circle layer and the heatmap ramp — warm, and clearly not
+ * the neutral white that means "selected" (D25).
+ */
+export const QUAKE_PULSE_LAYER: CircleLayerSpecification = {
+  id: PULSE_LAYER_ID,
+  type: "circle",
+  source: PULSE_SOURCE_ID,
+  // Follows Points mode, like the selection ring, and starts hidden.
+  layout: { visibility: "none" },
+  paint: {
+    "circle-radius": PULSE_MIN_RADIUS,
+    "circle-opacity": 0,
+    "circle-stroke-width": 2.2,
+    "circle-stroke-color": "#ffd166",
+    "circle-stroke-opacity": 0,
+  },
+};
+
+/**
+ * The three animated paint values at `t`, where 0 is the instant the quake
+ * arrived and 1 is the end of the ring's life.
+ *
+ * Ease-out on the radius and a slower fade on the opacity: the ring is most of
+ * the way out within the first second and then drifts to a stop, which reads
+ * as a ripple settling rather than as a blink. It thins as it grows, so the
+ * end of the animation is a faint wide circle and not a thick pale one.
+ */
+export function pulseFrame(t: number): {
+  radius: number;
+  width: number;
+  opacity: number;
+} {
+  const clamped = t < 0 ? 0 : t > 1 ? 1 : t;
+  const eased = 1 - Math.pow(1 - clamped, 3);
+
+  return {
+    radius: PULSE_MIN_RADIUS + (PULSE_MAX_RADIUS - PULSE_MIN_RADIUS) * eased,
+    width: 2.2 - 1.4 * eased,
+    opacity: 0.9 * Math.pow(1 - clamped, 1.6),
+  };
+}

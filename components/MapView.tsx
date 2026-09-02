@@ -20,13 +20,27 @@ import {
 import { parseQuakeCsv } from "@/lib/csv";
 import { countPointsInPolygon } from "@/lib/geo";
 import {
+  findNewQuakes,
+  LIVE_FEED_URL,
+  parseQuakeGeojson,
+  quakeKey,
+  quakeKeys,
+  REFRESH_INTERVAL_MS,
+} from "@/lib/live";
+import {
   DRAW_STYLES,
   EMPTY_COLLECTION,
   HEATMAP_LAYER_ID,
   LAYER_ID,
   MAP_INIT,
+  PULSE_DURATION_MS,
+  PULSE_LAYER_ID,
+  PULSE_SOURCE_ID,
+  pulseFrame,
   QUAKE_CIRCLE_LAYER,
   QUAKE_HEATMAP_LAYER,
+  QUAKE_PULSE_LAYER,
+  QUAKE_PULSE_SOURCE,
   QUAKE_SELECTED_LAYER,
   QUAKE_SELECTED_SOURCE,
   QUAKE_SOURCE,
@@ -50,12 +64,32 @@ import {
 // missing-token branch a plain render decision rather than an effect.
 const MAPBOX_TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
 
-/** Where the plotted features came from, and how that reads in the panels. */
+/**
+ * Where the plotted features came from, and how that reads in the panels.
+ *
+ * This is also the one place that knows whether live refresh applies. `upload`
+ * is the only kind that pauses it — see {@link isLive}, and D30 for why the
+ * answer is derived from here rather than tracked as a second piece of state
+ * that could disagree with this one.
+ */
 type DataSource =
   | { kind: "loading" }
   | { kind: "error"; message: string }
   | { kind: "sample"; plotted: number }
+  | { kind: "live"; plotted: number }
   | { kind: "upload"; fileName: string; plotted: number };
+
+/**
+ * Whether the thing on the map is the feed rather than the user's own file.
+ *
+ * The rule in one line, named once: a refresh must never overwrite data the
+ * user brought (D30). `loading` and `error` count as live because they are
+ * states of the feed itself — an `error` refresh is a retry, which is the most
+ * useful thing the button can do at that moment.
+ */
+function isLive(source: DataSource): boolean {
+  return source.kind !== "upload";
+}
 
 /** A file waiting on the user to say which column is which. */
 type MapperState = {
@@ -86,6 +120,27 @@ export default function MapView() {
   // `refreshSelection`.
   const ringedRef = useRef<QuakeFeature[]>([]);
 
+  // The keys of the last *successful live fetch* — not of whatever is on the
+  // map. Only `refreshLive` writes it, which is what makes the delta mean "new
+  // since the feed last answered" rather than "absent from the snapshot the
+  // page happened to open with". Null until the feed has answered once, which
+  // is what keeps the first refresh from pulsing everything (D33).
+  const liveKeysRef = useRef<Set<string> | null>(null);
+  // The running pulse cohort, or null when none is animating. `still` is the
+  // reader's reduced-motion preference, sampled when the cohort started.
+  const pulseRef = useRef<{ startedAt: number; still: boolean } | null>(null);
+  // The one rAF handle this component ever holds. Null means the loop is not
+  // running, which is the idle state — it is not left spinning between pulses.
+  const frameRef = useRef<number | null>(null);
+  // Mirrors `isLive(dataSource)` and `mode` for the callbacks that outlive a
+  // render: a timer tick, and the continuation of a fetch that was in flight
+  // when the user uploaded a file.
+  const liveRef = useRef(true);
+  const modeRef = useRef<MapMode>("points");
+  // Guards against a manual click landing on top of a timer tick, or a second
+  // click while the first fetch is still out.
+  const refreshingRef = useRef(false);
+
   // All plain UI state. None of it holds anything the map owns, so none of it
   // can trigger the render loop D3 keeps the map instance out of.
   const [dataSource, setDataSource] = useState<DataSource>({ kind: "loading" });
@@ -97,6 +152,10 @@ export default function MapView() {
   const [busy, setBusy] = useState(false);
   const [drawing, setDrawing] = useState(false);
   const [selection, setSelection] = useState<Selection | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState<number | null>(null);
+
+  const live = isLive(dataSource);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -131,6 +190,13 @@ export default function MapView() {
       // and with no polygon drawn its source is empty and it draws nothing.
       map.addSource(SELECTED_SOURCE_ID, QUAKE_SELECTED_SOURCE);
       map.addLayer(QUAKE_SELECTED_LAYER);
+
+      // The pulse goes on top of all three, and is additive in exactly the
+      // same way: its own source, its own layer, empty and fully transparent
+      // unless a refresh has just brought something. None of the layers below
+      // it is repainted, filtered or re-fed to make it work.
+      map.addSource(PULSE_SOURCE_ID, QUAKE_PULSE_SOURCE);
+      map.addLayer(QUAKE_PULSE_LAYER);
 
       wireInteractions(map, drawingRef);
       wireDrawing(map);
@@ -193,7 +259,7 @@ export default function MapView() {
         // Computed once, from the same features that were just handed to the
         // source. Nothing recomputes it on toggle.
         setStats(computeStats(features));
-        setDataSource({ kind: "sample", plotted: features.length });
+        applyDataSource({ kind: "sample", plotted: features.length });
 
         if (errors.length > 0) {
           console.warn(
@@ -203,12 +269,21 @@ export default function MapView() {
         }
       } catch (error) {
         if (cancelled) return;
-        setDataSource({ kind: "error", message: describeError(error) });
+        applyDataSource({ kind: "error", message: describeError(error) });
       }
     }
 
     return () => {
       cancelled = true;
+      // The animation frame goes first, and unconditionally: a frame left
+      // queued would fire after `map.remove()` and reach for a torn-down map.
+      // Nothing else in the pulse teardown is needed here — the source it
+      // would clear is about to cease to exist with the map.
+      if (frameRef.current !== null) {
+        cancelAnimationFrame(frameRef.current);
+        frameRef.current = null;
+      }
+      pulseRef.current = null;
       // `map.remove()` calls every control's onRemove, which leaves Draw's
       // internals torn down — so the ref is dropped in the same breath, or a
       // late refresh would ask a gutted Draw for its features.
@@ -222,6 +297,10 @@ export default function MapView() {
   // Switching modes is two layout-property flips on layers that already exist
   // and already hold the data — no refetch, no reparse, no setData.
   useEffect(() => {
+    // Read by `startPulse`, which is called from a fetch continuation and so
+    // cannot see this render's `mode`.
+    modeRef.current = mode;
+
     const map = mapRef.current;
     if (!map || !layersReady) return;
     if (!map.getLayer(LAYER_ID) || !map.getLayer(HEATMAP_LAYER_ID)) return;
@@ -247,7 +326,162 @@ export default function MapView() {
         mode === "points" ? "visible" : "none",
       );
     }
+
+    // The pulse follows Points mode for D25's reason, restated: a ring drawn
+    // around one quake is a claim about an individual point, and Heatmap mode
+    // deliberately has none — the arrival is already in the density. Leaving
+    // this effect the *only* owner of the layer's visibility is what keeps the
+    // animation loop from having to know about modes: it owns the layer's
+    // content, this owns whether the content is drawn.
+    if (map.getLayer(PULSE_LAYER_ID)) {
+      map.setLayoutProperty(
+        PULSE_LAYER_ID,
+        "visibility",
+        mode === "points" ? "visible" : "none",
+      );
+    }
+
+    // Switching to Heatmap mid-pulse ends it rather than animating something
+    // nobody can see. Switching back does not resurrect it: a pulse is an
+    // announcement of an arrival, and the moment to hear it has passed.
+    if (mode !== "points") stopPulse();
   }, [mode, layersReady]);
+
+  /**
+   * The auto-refresh timer.
+   *
+   * Its two dependencies are the whole of the pause rule: it exists only once
+   * the layers do, and only while the feed is what is on the map. Uploading a
+   * file flips `live` to false, React tears the interval down, and there is
+   * simply no timer left to clobber the user's data with (D30). Resetting to
+   * the sample flips it back and a fresh interval starts.
+   *
+   * There is no immediate fetch on mount. The sample is a deliberate first
+   * frame — instant, and independent of whether USGS is reachable — and
+   * replacing it two seconds in would read as a flicker rather than as news.
+   * The first live data lands on the first tick, or immediately if the reader
+   * presses Refresh (D31).
+   */
+  useEffect(() => {
+    if (!layersReady || !live) return;
+
+    const id = window.setInterval(() => {
+      void refreshLive();
+    }, REFRESH_INTERVAL_MS);
+
+    return () => window.clearInterval(id);
+  }, [layersReady, live]);
+
+  /**
+   * Two console handles for testing the pulse by hand, and **they do not exist
+   * in a production build**.
+   *
+   * `process.env.NODE_ENV` is inlined by Next at build time, so this is not a
+   * flag checked at runtime — the whole body is a dead branch that the
+   * minifier removes, along with everything only it referenced. There is
+   * nothing to ship, rather than something that ships and declines to run.
+   *
+   * They exist because the pulse is the one thing here that cannot be
+   * triggered on demand: it fires only when the USGS feed gains an event, and
+   * M4.5+ worldwide averages one every couple of hours. The honest lever is
+   * the baseline — `liveKeysRef` is what the next fetch is diffed against, so
+   * forgetting a few of its keys makes those quakes read as arrivals. Nothing
+   * is faked: the features that pulse are real ones that really came back in
+   * a real fetch.
+   *
+   * The effect is deliberately last among the effects and reads only refs, so
+   * nothing else in the component can be affected by its presence.
+   */
+  useEffect(() => {
+    if (process.env.NODE_ENV === "production") return;
+
+    const scope = window as typeof window & {
+      __seismicDropKeys?: (count?: number) => QuakeFeature[];
+      __seismicMap?: mapboxgl.Map | null;
+    };
+
+    scope.__seismicMap = mapRef.current;
+
+    scope.__seismicDropKeys = (count = 3) => {
+      const baseline = liveKeysRef.current;
+
+      if (!baseline) {
+        console.warn(
+          "[Seismic Atlas] No live baseline yet — the feed has not answered this session.\n" +
+            "Press Refresh once (or wait for the first tick), then call this again.",
+        );
+        return [];
+      }
+
+      if (!liveRef.current) {
+        console.warn(
+          '[Seismic Atlas] Uploaded data is showing, so refresh is paused and nothing will pulse.\n' +
+            'Press "Reset to sample" first.',
+        );
+        return [];
+      }
+
+      if (modeRef.current !== "points") {
+        console.warn(
+          "[Seismic Atlas] Heatmap mode does not pulse (D34). Dropping the keys anyway —\n" +
+            "switch to Points *before* you refresh, or the next fetch consumes them and draws nothing.",
+        );
+      }
+
+      // The biggest quakes on the map, because a ring around a 15px M7 disc is
+      // findable at world zoom and one around a 3px M4.6 is not. They are also
+      // the least likely to roll off the month window between now and the
+      // fetch that is meant to pulse them.
+      const dropped = [...featuresRef.current]
+        .sort((a, b) => b.properties.mag - a.properties.mag)
+        .slice(0, Math.max(1, count))
+        // `Set.delete` reports whether the key was actually there, so this
+        // filters to what genuinely left the baseline.
+        .filter((feature) => baseline.delete(quakeKey(feature)));
+
+      if (dropped.length === 0) {
+        console.warn(
+          "[Seismic Atlas] Nothing was dropped — the map's features and the baseline have diverged.\n" +
+            "Press Refresh once to resynchronise them, then call this again.",
+        );
+        return [];
+      }
+
+      console.log(
+        `[Seismic Atlas] Dropped ${dropped.length} key(s); baseline is now ${baseline.size}.\n` +
+          "Press Refresh (or wait for the next tick). These should pulse for ~4s, and nothing else should move:",
+      );
+      for (const feature of dropped) {
+        const [lng, lat] = feature.geometry.coordinates;
+        console.log(
+          `  M${feature.properties.mag} · ${feature.properties.place}\n` +
+            `      __seismicMap.flyTo({ center: [${lng}, ${lat}], zoom: 4 })`,
+        );
+      }
+
+      return dropped;
+    };
+
+    return () => {
+      delete scope.__seismicDropKeys;
+      delete scope.__seismicMap;
+    };
+  }, [layersReady]);
+
+  /**
+   * The one path that changes `dataSource`, and with it the answer to "may a
+   * refresh touch the map?".
+   *
+   * The ref is written here rather than in an effect mirroring `dataSource`,
+   * because the reader that matters is `refreshLive` picking back up after an
+   * `await` — and an effect runs after the render that would have told it. A
+   * fetch that was in flight when the user uploaded a file has to see the new
+   * answer at the instant the upload happened, not one render later (D30).
+   */
+  function applyDataSource(next: DataSource) {
+    liveRef.current = isLive(next);
+    setDataSource(next);
+  }
 
   /**
    * The one path that changes what is on the map. Uploaded and sample data go
@@ -261,6 +495,12 @@ export default function MapView() {
     const map = mapRef.current;
     const source = map?.getSource(SOURCE_ID) as GeoJSONSource | undefined;
     if (!map || !source) return false;
+
+    // A running pulse belongs to the fetch that produced it. Whatever the new
+    // data is — an upload, a reset, the next refresh — those rings are now
+    // drawn over a set that no longer contains them, so they end here. The
+    // refresh path starts its own cohort immediately after this returns.
+    stopPulse();
 
     source.setData({ type: "FeatureCollection", features });
     featuresRef.current = features;
@@ -350,6 +590,217 @@ export default function MapView() {
     refreshSelection();
   }
 
+  /* -------------------------------------------------------------------------
+     Live refresh
+     ------------------------------------------------------------------------- */
+
+  /**
+   * Pulls the USGS feed and puts it on the map, from the timer or the button —
+   * they are the same call, because they should do the same thing.
+   *
+   * Everything that could go wrong ends the same way: the data already on the
+   * map stays exactly where it is and one quiet line says the update did not
+   * land (D18's rule, applied to a source that fails on its own schedule). The
+   * timer is untouched by a failure; the next tick simply tries again.
+   */
+  async function refreshLive() {
+    // One fetch at a time. A button press during a timer tick — or an
+    // impatient double-click — is a no-op rather than a second request.
+    if (refreshingRef.current) return;
+    if (!liveRef.current) return;
+
+    refreshingRef.current = true;
+    setRefreshing(true);
+
+    try {
+      // `no-store` because the feed is the point: a 304 from the browser cache
+      // would report success and change nothing.
+      const response = await fetch(LIVE_FEED_URL, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`the feed responded ${response.status}`);
+      }
+
+      const { features, errors, skippedRows } = parseQuakeGeojson(
+        await response.json(),
+      );
+
+      // The map has gone (unmount), or the user uploaded a file while this
+      // was in flight. Either way what came back is no longer wanted, and in
+      // the second case writing it would destroy their data — which is the
+      // one thing refresh must never do (D30).
+      if (!mapRef.current || !liveRef.current) return;
+
+      if (features.length === 0) {
+        throw new Error("the feed returned no usable events");
+      }
+
+      // The delta is taken *before* the keys are replaced, and against the
+      // previous live fetch rather than against what is on the map: see the
+      // note on `liveKeysRef`.
+      const arrived = findNewQuakes(liveKeysRef.current, features);
+      liveKeysRef.current = quakeKeys(features);
+
+      // The existing path, unchanged: setData on the one source, recompute
+      // the stats, recount the polygon if there is one. Nothing about refresh
+      // is a second way for data to reach the map (D19).
+      if (!showFeatures(features, { fit: false })) {
+        throw new Error("the map is not ready");
+      }
+
+      applyDataSource({ kind: "live", plotted: features.length });
+      setLastUpdated(Date.now());
+      // A failure notice always ends "still showing the last data that
+      // loaded", and newer data has just landed, so the sentence has stopped
+      // being true. An info notice reports a load the reader asked for and is
+      // theirs to dismiss.
+      setNotice((current) => (current?.tone === "error" ? null : current));
+      startPulse(arrived);
+
+      if (errors.length > 0) {
+        console.warn(
+          `[Seismic Atlas] skipped ${skippedRows} feature(s) in the live feed:`,
+          errors,
+        );
+      }
+    } catch (error) {
+      if (!mapRef.current) return;
+      console.warn("[Seismic Atlas] live refresh failed:", error);
+      setNotice({
+        tone: "error",
+        text: `Couldn't refresh — ${describeError(error)}. Still showing the last data that loaded.`,
+      });
+    } finally {
+      refreshingRef.current = false;
+      setRefreshing(false);
+    }
+  }
+
+  /* -------------------------------------------------------------------------
+     The arrival pulse
+
+     One requestAnimationFrame loop, and it only exists while something is
+     pulsing. The Phase 4 per-frame recount is driven by Draw's own render
+     event, which comes from Draw's store and not from map repaints, so the two
+     never drive each other — see D35 for why that matters and what was checked.
+     ------------------------------------------------------------------------- */
+
+  /**
+   * Starts a ring on each of `features`, replacing whatever was pulsing.
+   *
+   * Replacing rather than merging is what stops pulses accumulating: there is
+   * one cohort with one start time, so the loop animates three scalars however
+   * many rings are on screen, and a cohort that is four seconds old is gone
+   * whether or not a new one arrives.
+   */
+  function startPulse(features: QuakeFeature[]) {
+    if (features.length === 0) return;
+
+    // Nothing to see in Heatmap mode, so nothing is started — no source
+    // write, no loop, no frames spent on an invisible layer.
+    if (modeRef.current !== "points") return;
+
+    const source = mapRef.current?.getSource(PULSE_SOURCE_ID) as
+      | GeoJSONSource
+      | undefined;
+    if (!source) return;
+
+    // The only `setData` this animation performs: once, at the start. The
+    // frames after it move paint properties, never data — which is what keeps
+    // it off the worker and out of the way of the quake source (D34).
+    source.setData({ type: "FeatureCollection", features });
+    pulseRef.current = { startedAt: performance.now(), still: prefersStillness() };
+
+    // Frame zero, painted here rather than waited for. `setData` takes effect
+    // on the next repaint, and the paint properties are still sitting where
+    // the *previous* cohort's last frame left them — a wide, all-but-invisible
+    // ring — so without this the first thing drawn is the end of the last
+    // animation rather than the start of this one.
+    paintPulse(0);
+
+    if (frameRef.current === null) {
+      frameRef.current = requestAnimationFrame(stepPulse);
+    }
+  }
+
+  /**
+   * Whether the reader has asked the system for less movement.
+   *
+   * Read per cohort rather than cached: it is one media-query lookup every few
+   * minutes at most, and the setting can change while the page is open.
+   */
+  function prefersStillness(): boolean {
+    return (
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    );
+  }
+
+  /** Writes one frame's three values onto the layer. */
+  function paintPulse(t: number) {
+    const map = mapRef.current;
+    if (!map || !map.getLayer(PULSE_LAYER_ID)) return;
+
+    // Under `prefers-reduced-motion` the ring does not travel: the geometry is
+    // frozen at the size it would have settled at, and only the opacity runs.
+    // A fade is not the kind of movement that setting is about, and dropping
+    // the pulse entirely would take the signal away from readers who asked for
+    // calm rather than for silence.
+    const geometry = pulseFrame(pulseRef.current?.still ? 1 : t);
+    const { opacity } = pulseFrame(t);
+
+    map.setPaintProperty(PULSE_LAYER_ID, "circle-radius", geometry.radius);
+    map.setPaintProperty(PULSE_LAYER_ID, "circle-stroke-width", geometry.width);
+    map.setPaintProperty(PULSE_LAYER_ID, "circle-stroke-opacity", opacity);
+  }
+
+  /**
+   * One frame. Reads only refs and the map, so the copy of this function that
+   * a queued frame is holding is as good as the current one.
+   *
+   * `requestAnimationFrame` hands back a timestamp on the same clock
+   * `performance.now()` reads, so the elapsed time is exact and the animation
+   * does not drift with the frame rate.
+   */
+  function stepPulse(now: number) {
+    frameRef.current = null;
+
+    const map = mapRef.current;
+    const pulse = pulseRef.current;
+    if (!map || !pulse || !map.getLayer(PULSE_LAYER_ID)) {
+      stopPulse();
+      return;
+    }
+
+    const t = (now - pulse.startedAt) / PULSE_DURATION_MS;
+    if (t >= 1) {
+      stopPulse();
+      return;
+    }
+
+    paintPulse(t);
+    frameRef.current = requestAnimationFrame(stepPulse);
+  }
+
+  /**
+   * Ends the animation and empties the layer. Not scheduling the next frame is
+   * the whole of "pause when idle": between pulses this component holds no rAF
+   * at all and costs the browser nothing.
+   */
+  function stopPulse() {
+    if (frameRef.current !== null) {
+      cancelAnimationFrame(frameRef.current);
+      frameRef.current = null;
+    }
+    if (pulseRef.current === null) return;
+    pulseRef.current = null;
+
+    const source = mapRef.current?.getSource(PULSE_SOURCE_ID) as
+      | GeoJSONSource
+      | undefined;
+    source?.setData(EMPTY_COLLECTION);
+  }
+
   /** Keeps the popup handler's copy of "are we drawing?" with the UI's. */
   function setDrawingMode(next: boolean) {
     drawingRef.current = next;
@@ -413,7 +864,7 @@ export default function MapView() {
       return;
     }
 
-    setDataSource({ kind: "upload", fileName, plotted: features.length });
+    applyDataSource({ kind: "upload", fileName, plotted: features.length });
     setNotice({
       tone: "info",
       text:
@@ -519,7 +970,7 @@ export default function MapView() {
       zoom: MAP_INIT.zoom,
       duration: 700,
     });
-    setDataSource({ kind: "sample", plotted: features.length });
+    applyDataSource({ kind: "sample", plotted: features.length });
     setNotice({
       tone: "info",
       text: `Back to the sample · ${plural(features.length, "point")}`,
@@ -581,9 +1032,13 @@ export default function MapView() {
                 sourceLabel={sourceLabel(dataSource)}
                 busy={busy}
                 canReset={dataSource.kind === "upload"}
+                live={live}
+                refreshing={refreshing}
+                lastUpdated={lastUpdated}
                 notice={notice}
                 onFile={(file) => void handleFile(file)}
                 onReset={() => void handleReset()}
+                onRefresh={() => void refreshLive()}
                 onDismissNotice={() => setNotice(null)}
               />
               {mapper && (
@@ -654,6 +1109,11 @@ function describe(source: DataSource): string {
       return `Could not load quake data — ${source.message}`;
     case "sample":
       return `${source.plotted} quakes · M4.5+ past month`;
+    // Same sentence as the sample's, plus the one word that is different
+    // about it. The reader should not have to notice the change to be told
+    // what they are looking at.
+    case "live":
+      return `${source.plotted} quakes · M4.5+ past month · live`;
     case "upload":
       return `${source.plotted} quakes · ${source.fileName}`;
   }
@@ -667,6 +1127,8 @@ function sourceLabel(source: DataSource): string {
       return "No data loaded";
     case "sample":
       return "Sample · USGS M4.5+, past month";
+    case "live":
+      return "Live · USGS M4.5+, past month";
     case "upload":
       return `Uploaded · ${source.fileName}`;
   }

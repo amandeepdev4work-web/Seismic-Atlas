@@ -543,3 +543,39 @@ body {
 .mapboxgl-ctrl-group.mapboxgl-ctrl:empty {
   display: none;
 }
+
+/* ---------------------------------------------------------------------------
+   The refreshing indicator (components/DataPanel.tsx)
+
+   A dot that breathes, not a spinner that races. The map underneath is the
+   thing worth watching and a rotating ring in the corner pulls the eye off it;
+   this is meant to be noticed only if you look for it. `prefers-reduced-motion`
+   stops it moving and leaves it visible, because it is a state and not a
+   decoration - the word beside it already says what is happening.
+   --------------------------------------------------------------------------- */
+
+.data-panel__dot {
+  flex: none;
+  width: 0.36rem;
+  height: 0.36rem;
+  border-radius: 50%;
+  background: #ffd166;
+  animation: data-panel-breathe 1.4s ease-in-out infinite;
+}
+
+@keyframes data-panel-breathe {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .data-panel__dot {
+    animation: none;
+    opacity: 0.8;
+  }
+}

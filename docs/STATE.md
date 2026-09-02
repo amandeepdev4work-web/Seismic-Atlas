@@ -1,11 +1,57 @@
 # Current State
 
-_Last updated: Phase 4 follow-up — per-frame live counting while dragging_
+_Last updated: Project complete — all five phases shipped, deployed, and verified in-browser._
 
-Phases 1 through 4 are built and machine-verified as far as this environment
-allows: `npm test` (89 passing), `npm run typecheck` and `npm run build` are
-all clean, and the production build ships the new controls in both the CSS and
-the JS chunks.
+**Every phase on the roadmap is built, deployed live, and confirmed in a real
+browser.** `npm test` (130 passing), `npm run typecheck` and `npm run build`
+are all clean. Beyond the machine checks, every interactive behaviour has been
+manually verified against the live deployment: point rendering and popups, the
+heatmap and its toggle, CSV upload with column mapping and bad-file guards, the
+polygon filter with live antimeridian-correct counting, and live refresh with
+the arrival pulse — including the amber pulse and the white selection ring
+reading as distinct on the same quake in a dense cluster. The live USGS feed
+serves with open CORS, so the deployed build behaves as the local one does. The
+full step-by-step verification record lives in `docs/TESTING.md`.
+
+Phase 5 makes the map live. The USGS M4.5+ GeoJSON feed is re-fetched every 60
+seconds — and on demand from a `Refresh` button in the data panel — and any
+quake that was not in the previous fetch gets a soft amber ring that expands
+and fades over four seconds. Everything else stays exactly as calm as it was.
+
+Three things about it are worth knowing before touching it, and each has a
+decision entry behind it:
+
+1. **Refresh is paused by the data source, structurally.** The timer lives in
+   an effect keyed on `[layersReady, live]`, so uploading a CSV does not make
+   the timer decline to fire — it makes React tear the timer down. There is
+   nothing left to clobber the user's data with. A fetch already in flight is
+   caught by a re-check after the `await`, reading a ref that is written
+   synchronously rather than mirrored in an effect (D30).
+2. **A quake's identity is `time|lng|lat|mag`, not the USGS event id.** The id
+   exists only on the GeoJSON path, so it could never compare a live fetch
+   against the CSV sample the page opens with. This was checked against real
+   data, not argued: 606 of the live feed's 631 events matched sample-CSV
+   features exactly by key (D32).
+3. **The pulse baseline is the last *live* fetch, not what is on the map.**
+   Diffing against the displayed data sounds more natural and would have rung
+   25 rings simultaneously on the first auto-refresh, because the bundled
+   sample is a snapshot of a rolling feed. Anchoring on the previous live
+   fetch makes the first one pulse nothing and every one after it a genuine
+   sixty-second delta (D33).
+
+The pure parts — the feed adapter and the diff — live in a new module,
+`lib/live.ts`, which is where the 41 new tests point. The timer, the animation
+loop and the map are not tested and will not be (D9).
+
+Phases 1, 2 and 4 are again provably untouched: `git diff --numstat` reports
+**0 deletions** in `lib/mapbox.ts` (89 additions, all appended below the Draw
+theme) and **0 deletions** in `app/globals.css` (36 additions). No layer's
+paint values moved; the pulse is a fourth source and a fifth layer above them.
+`components/MapView.tsx` is `467 5`, and every one of those five deletions is
+either a reworded doc comment or a `setDataSource` renamed to
+`applyDataSource`. `components/DataPanel.tsx` is `90 3`, on the same terms.
+The parser, `lib/geo.ts`, the popup, the legend, the mapper, the upload path
+and the polygon count logic were not touched at all.
 
 Phase 4 puts a drawing tool on the map. Draw a polygon and the panel says how
 many of the loaded quakes are inside it, recomputing as the shape is created,
@@ -191,16 +237,67 @@ nothing outside the upload path, the mapper and the overlay CSS:
     polygon is the only mode this app enables. Typed as a local `DrawStyle`
     shape rather than a `LayerSpecification`, because Draw injects `source`
     itself and clones each entry into a hot and a cold copy.
+
+  Phase 5 **appended** again, 89 lines and no deletions:
+  - `PULSE_SOURCE_ID` / `PULSE_LAYER_ID`, `PULSE_DURATION_MS` (4000),
+    `QUAKE_PULSE_SOURCE` (empty, like the other two) and `QUAKE_PULSE_LAYER` —
+    a circle layer with no fill and an amber `#ffd166` stroke, starting fully
+    transparent so a layer with no animation behind it draws nothing whatever
+    is in its source. It starts `visibility: none` and follows Points mode.
+    Its `circle-radius` is a **flat number, not a magnitude interpolation** —
+    which is what keeps this layer out of the keep-in-sync obligation D20 and
+    D25 carry, and D34 argues it is also the right thing to draw.
+  - `pulseFrame(t)` — the three animated values at `t ∈ [0, 1]`, clamped at
+    both ends. Ease-out cubic on the radius, a slower power fade on the
+    opacity, and a stroke that thins as it grows. Sampled: `t=0` is 5.0px at
+    0.90 alpha, `t=0.25` (1s) is 19.5px at 0.57, `t=0.5` is 26.9px at 0.30,
+    `t=0.75` is 29.6px at 0.10, and it ends at 30.0px and 0. So most of the
+    travel is in the first second and the last second is barely visible —
+    a ripple settling rather than a blink.
 - `lib/stats.ts` — unchanged. `computeStats(features): QuakeStats`, pure,
   single pass, every aggregate nullable (D14). Phase 3 reuses it verbatim: it
   is recomputed once per successful load, sample or upload, on the same
   features handed to the source.
+- `lib/live.ts` — **new in Phase 5**, and the only thing Phase 5 unit-tests.
+  Pure: no DOM, no fetch, no globals, no map. Four exports plus two constants:
+  - `LIVE_FEED_URL` — the M4.5+ month **GeoJSON** summary. The GeoJSON rather
+    than the CSV because it is cached ~1 minute against the CSV's ~5, and
+    because it already arrives as a FeatureCollection, which is the internal
+    format anyway (D2).
+  - `REFRESH_INTERVAL_MS` — 60 000.
+  - `parseQuakeGeojson(input: unknown): ParseResult` — the adapter. Returns the
+    same `ParseResult` the CSV parser does, holding features that are
+    `toEqual`-identical to what `parseQuakeCsv` produces for the same event.
+    It takes `unknown` because the input is a parsed network response and
+    nothing has checked it: a document that is not a FeatureCollection is one
+    error having skipped nothing (D16's shape), and any individual entry that
+    is malformed — no geometry, a null geometry, a non-Point, a one-element
+    coordinate array, a `NaN` coordinate, a null feature — is skipped rather
+    than thrown on. The **rules** are D4/D5's and are deliberately restated
+    rather than shared with `lib/csv.ts`: that parser reads string cells out of
+    papaparse rows and every helper in it is built around that, so reusing it
+    would mean turning numbers back into strings to have them parsed again.
+    What must not drift is the outcome, and 15 tests pin the outcome. Two
+    details of the feed's own shape: **depth is the third coordinate**, not a
+    property; and `time` is epoch milliseconds, converted to the exact ISO 8601
+    string the CSV feed writes — which is the load-bearing line, because it is
+    what makes a live feature and a sample feature for the same earthquake
+    identical.
+  - `quakeKey(feature)` — `time|longitude|latitude|mag`. Not the USGS event id,
+    and D32 is the whole argument for that.
+  - `quakeKeys(features)` — the key set of one fetch.
+  - `findNewQuakes(previous, features)` — the features whose key is not in
+    `previous`, as **the very same objects in input order** (the contract
+    `countPointsInPolygon` keeps, for the same reason: the caller feeds them
+    straight to a source). `null`, `undefined` and an empty set all mean
+    "nothing is new" — the first-load rule, and D33 says why that reading was
+    chosen over the other one.
 - `lib/branding.ts` — unchanged; `APP_NAME` is still the single source of truth
   for the product name.
 
 #### The Phase 2 heatmap paint values, for reference
-Unchanged in Phase 3 and reproduced here because the eyeball checklist below
-still refers to them. Weight is compressed to 0.5 at M4.5 → 1.0 at M8.5.
+Unchanged in Phase 3 and reproduced here because the verification record in
+`docs/TESTING.md` refers to them. Weight is compressed to 0.5 at M4.5 → 1.0 at M8.5.
 `heatmap-intensity` runs 0.3 at z0 → 0.36 at z1.5 → 0.75 at z3 → 1.3 at z5 →
 1.8 at z7 → 2.2 at z9. `heatmap-radius` is 18px at z0 → 24 at z2 → 36 at z4 →
 52 at z6 → 85 at z9. The colour ramp is `rgba(94,30,12,0)` at density 0, a dim
@@ -297,6 +394,72 @@ fitted against a model of Mapbox's shader — see D15.
   - **The effect cleanup drops `drawRef`**, because `map.remove()` calls every
     control's `onRemove` and leaves Draw's internals torn down; a late refresh
     would otherwise ask a gutted Draw for its features.
+
+  What Phase 5 added, again around the existing structure rather than through
+  it. Five deletions in the whole file, all of them either a reworded doc
+  comment or `setDataSource` renamed to `applyDataSource`:
+  - **`DataSource` gained a `live` kind**, and `isLive(source)` —
+    `kind !== "upload"` — is the single named place that answers "may a refresh
+    touch the map?". There is deliberately no second piece of state saying the
+    same thing (D30). `describe` and `sourceLabel` gained the matching case:
+    "631 quakes · M4.5+ past month · live" and "Live · USGS M4.5+, past month".
+  - **`applyDataSource(next)`** is now the one path that changes `dataSource`,
+    and it writes `liveRef` **synchronously** on the way through. That is the
+    point of it: the reader that matters is `refreshLive` picking back up after
+    an `await`, and an effect mirroring the state would run one render too
+    late. Same reason `drawingRef` exists for the popup handler.
+  - **Six more refs.** `liveKeysRef` (the keys of the last successful *live*
+    fetch — not of what is on the map, and D33 is why), `pulseRef` (the running
+    cohort's start time and the reader's reduced-motion preference, or null),
+    `frameRef` (the one rAF handle this component ever holds; null means idle),
+    `liveRef` and `modeRef` (mirrors, for callbacks that outlive a render), and
+    `refreshingRef` (one fetch at a time).
+  - **`refreshLive()`** — the timer and the button call the identical function,
+    because they should do the identical thing. Fetches with `cache: "no-store"`
+    (a 304 out of the browser cache would report success and change nothing),
+    adapts, re-checks `mapRef` and `liveRef` after the `await`, takes the delta
+    *before* replacing `liveKeysRef`, and then goes through **`showFeatures`** —
+    the same single path an upload takes (D19), so the stats recompute and the
+    polygon recount for free. Every failure ends the same way: the data on the
+    map stays, one warm notice says the update did not land, and the timer is
+    untouched. A later success clears that notice, because it ends "still
+    showing the last data that loaded" and newer data has just landed.
+  - **The auto-refresh effect**, `[layersReady, live]`. Those two dependencies
+    *are* the pause rule: an upload flips `live` false and React removes the
+    interval; a reset flips it back and a new one starts. There is no immediate
+    fetch on mount — D31 says why the sample stays as the first frame.
+  - **`startPulse` / `stepPulse` / `paintPulse` / `stopPulse`** — one rAF loop
+    that exists only while something is pulsing. `startPulse` writes the cohort
+    to the pulse source **once** and paints frame zero synchronously; the four
+    seconds after that move three scalars and never touch data (D34). It
+    returns early in Heatmap mode, so no frames are spent on an invisible
+    layer. `stopPulse` does not schedule another frame, which is the whole of
+    "pause when idle", and it is also called from `showFeatures` — those rings
+    were computed against a feature set that is no longer on the map.
+  - **The mode effect gained a fourth branch and a mirror.** It writes
+    `modeRef`, sets the pulse layer's visibility (Points only, D25's argument
+    transferred), and ends any running pulse on the way into Heatmap mode. It
+    is the *only* owner of that layer's visibility; the animation is the only
+    owner of its content, so neither has to know about the other.
+  - **The effect cleanup cancels the frame** unconditionally and before
+    `map.remove()` — a queued frame would otherwise fire against a torn-down
+    map, the same hazard `drawRef` is dropped for.
+  - **Two dev-only console handles**, `__seismicDropKeys(n)` and
+    `__seismicMap`, in a final effect guarded by
+    `process.env.NODE_ENV === "production"`. Next inlines that at build time,
+    so the branch is dead code the minifier removes — **there is nothing to
+    ship, rather than something that ships and declines to run**, and the
+    built chunks were grepped to confirm it (see Verified). They exist because
+    the pulse is the one behaviour here that cannot be triggered on demand:
+    it fires only when the feed gains an event, and M4.5+ worldwide averages
+    one every couple of hours. `__seismicDropKeys` deletes the N
+    highest-magnitude quakes' keys from `liveKeysRef` — the biggest because a
+    ring around a 15px M7 disc is findable at world zoom and one around a 3px
+    M4.6 is not — so the next fetch reads them as arrivals. Nothing is faked;
+    the features that pulse are real ones from a real response, and the
+    refresh rebuilds the baseline, so the effect is one-shot. It refuses with
+    an explanation when there is no baseline yet or an upload is showing, and
+    warns (but proceeds) in Heatmap mode.
 - `components/SelectionPanel.tsx` — **new in Phase 4.** "Draw area", "Clear"
   (only while a shape exists), and the count. Buttons reuse
   `.data-panel__button`, the pill language the data panel and the mapper
@@ -313,12 +476,31 @@ fitted against a model of Mapbox's shader — see D15.
   says where to find the handles. The control and the number are in the same
   panel deliberately — D26 argues that against putting the count in the stats
   bar.
-- `components/DataPanel.tsx` — **new.** Upload button, "Reset to sample"
-  (shown only when uploaded data is displayed), the current source label, and
-  the dismissible notice. The picker is a hidden `<input type="file">` driven
-  by a real button — no `<form>`, since the file never leaves the browser. The
-  input's value is cleared on every pick so re-selecting the same file fires
-  again.
+- `components/DataPanel.tsx` — **new in Phase 3.** Upload button, "Reset to
+  sample" (shown only when uploaded data is displayed), the current source
+  label, and the dismissible notice. The picker is a hidden
+  `<input type="file">` driven by a real button — no `<form>`, since the file
+  never leaves the browser. The input's value is cleared on every pick so
+  re-selecting the same file fires again.
+
+  **Phase 5 put the refresh control here** rather than in a fifth panel, which
+  is the guardrail Phase 4 carried forward: this panel already names where the
+  data came from, and "and it updated 40 seconds ago" is the same sentence
+  continued (D31). Three additions and nothing moved:
+  - A `Refresh` pill in the row that already holds `Upload CSV`, reading
+    "Refreshing…" and disabled while a fetch is out. It is **hidden**, not
+    disabled, while an upload is displayed — a disabled control asks the reader
+    to work out why, and the space is spent saying it instead.
+  - One quiet status line under the source label, `aria-live="polite"` because
+    it changes on a timer and must never interrupt a screen reader mid-
+    sentence. Four states: "Auto-refresh paused while your file is shown.";
+    a breathing dot plus "Fetching the latest events…"; "Live · refreshes every
+    60s" before the first fetch; and "Updated 42s ago" after it.
+  - `ElapsedSince`, a component whose entire job is that clock, with its own
+    one-second interval. A `now` ticking in `MapView` would re-render the
+    legend, the toggle, the selection panel and the mapper once a second for
+    the sake of two characters. The label is coarse on purpose — "just now",
+    seconds, then minutes.
 - `components/ColumnMapper.tsx` — **new.** One `Select` per field, required
   ones marked (an asterisk plus a visually-hidden "(required)" for screen
   readers), pre-filled from `guessMapping`. Live problems from
@@ -371,6 +553,17 @@ fitted against a model of Mapbox's shader — see D15.
   `:empty` is the whole condition, so a control group with buttons in it is
   left alone.
 
+  Phase 5 appended 36 lines and deleted none, all of them `.data-panel__dot`:
+  the fetching indicator, a 0.36rem amber dot breathing on a 1.4s opacity
+  keyframe. A dot rather than a spinner because the map underneath is the
+  thing worth watching and a rotating ring in the corner pulls the eye off it.
+  `prefers-reduced-motion` stops it moving and leaves it visible — it is a
+  state, not a decoration, and the words beside it already say what is
+  happening. Read in document order the built chunk still goes mapbox-gl.css →
+  mapbox-gl-draw.css (40991) → globals.css (45514) → Phase 4's `:empty` rule
+  (51998) → this block (52053), so D10's ordering holds with a fifth block on
+  the end.
+
 ### Tests
 - `vitest.config.mts` — node environment (no jsdom: nothing under test touches
   the DOM), `include: ["tests/**/*.test.ts"]`, `resolve.tsconfigPaths`.
@@ -416,16 +609,43 @@ fitted against a model of Mapbox's shader — see D15.
   answered by the even-odd rule); the date line, both ways round and with a
   wrapped point counted exactly once; and a 29-feature global set filtered to
   a 25-point region.
-- The upload UI, the dropdowns, the drawing and the map are deliberately
-  untested (D9). Note what that means: `checkUploadFile`, `looksBinary`, the
-  clamps and now `countPointsInPolygon` are covered because they are pure
-  functions, but `Select`'s keyboard handling and every Draw event are not —
-  they are DOM and WebGL behaviour, and testing them would mean the jsdom
-  setup D9 declined plus mocking Draw's event plumbing. They are on the
-  eyeball list instead, with the specific things to press and drag.
+- `tests/live.test.ts` — **new in Phase 5**, 41 tests over `lib/live.ts` only.
+  The adapter: a real feed feature becoming the expected four properties,
+  depth taken from the third coordinate and *not* from a `depth` property,
+  feed order preserved, and — the one that matters — a feature built from the
+  GeoJSON path being `toEqual` a feature built from the CSV path for the same
+  earthquake, with matching keys. The document itself: a non-collection
+  reported once having skipped nothing, and `null`/`undefined`/a string/an
+  array/a non-array `features` field all refused without throwing; an empty
+  collection is an empty result, not an error. The row rules, which is the
+  evidence D4/D5 did not drift: a missing magnitude, a non-numeric one quoted
+  back, out-of-range latitude and longitude, a non-Point geometry, six
+  malformed entries skipped rather than thrown on, good features kept
+  alongside bad and numbered by feed position, the cosmetic fields falling
+  back rather than losing the quake, a blank place, an unusable timestamp, and
+  a magnitude of zero accepted because it is a number and not a blank.
+  `quakeKey`: same key for two objects describing one event, and a different
+  key for each of the four fields varied on its own. `findNewQuakes`: only the
+  absent ones; the very same objects in input order; nothing when the two
+  fetches are identical; nothing when the previous set is empty, `null` or
+  `undefined`; nothing in an empty fetch; departures from the rolling window
+  ignored; and an event matched across the CSV and GeoJSON paths at once.
+- The upload UI, the dropdowns, the drawing, the timer, the animation loop and
+  the map are deliberately untested (D9). Note what that means:
+  `checkUploadFile`, `looksBinary`, the clamps, `countPointsInPolygon` and now
+  `parseQuakeGeojson` and `findNewQuakes` are covered because they are pure
+  functions, but `Select`'s keyboard handling, every Draw event, the
+  `setInterval` and the `requestAnimationFrame` loop are not — they are DOM,
+  timer and WebGL behaviour, and testing them would mean the jsdom setup D9
+  declined plus fake timers and mocked animation frames. They are covered by
+  the manual verification record in `docs/TESTING.md` instead, with the
+  specific things to press and watch — all since confirmed passing.
 
 ## Dependencies
-**Unchanged, again.** Phase 4 added no runtime and no dev dependencies —
+**Unchanged, again.** Phase 5 added no runtime and no dev dependencies —
+`git diff` touches neither `package.json` nor `package-lock.json`; the live
+feed is `fetch`, and the animation is `requestAnimationFrame`. Phase 4 added
+none either —
 `git diff` touches neither `package.json` nor `package-lock.json`. Runtime is
 `next`, `react`, `react-dom`, `mapbox-gl`, `papaparse`, `@turf/turf`,
 `@mapbox/mapbox-gl-draw`; dev adds `vitest`, `@types/geojson` and
@@ -451,6 +671,77 @@ their keep as D21 predicted they would:
 
 ## Verified
 Everything in this section was actually run, in this environment.
+
+### Phase 5
+- `npm test` → **130 passed** (6 csv + 7 stats + 23 columns + 28 upload + 25
+  geo + 41 live). `npm run typecheck` → clean. `npm run build` → compiled, 3
+  static pages, no warnings.
+- **This environment turned out to have network access**, which Phases 1–4
+  never needed, so Phase 5's central claims were checked against the real USGS
+  feed rather than against fixtures. The feed answers `200` with
+  `Access-Control-Allow-Origin: *`, so the browser fetch will work.
+- **The adapter, over the real feed:** 631 features in, **631 kept, 0
+  skipped, 0 errors**. `computeStats` over the result reads 631 / M 7.8 at "64
+  km NNW of Ende, Indonesia" / 0–645.026 km — the same headline event the
+  sample has, which is the sanity check that the two paths are describing the
+  same catalogue. Adapting all 631 takes **2.7 ms**.
+- **The identity key, on real data and not in the abstract.** Diffed against
+  the real 619-row sample CSV through the real `parseQuakeCsv`:
+
+  | | |
+  |---|---|
+  | Live feed events | 631 |
+  | Sample CSV events | 619 |
+  | **Matched across CSV ↔ GeoJSON by key** | **606** |
+  | In the feed, not in the snapshot (arrived since) | 25 |
+  | In the snapshot, not in the feed (rolled off the month) | 13 |
+
+  606 exact matches is the whole of D32's argument demonstrated: a key built
+  from time, position and magnitude identifies the same earthquake on both
+  data paths, which an event id could not have done.
+- **Two back-to-back fetches of the live feed produced zero deltas.** This is
+  the failure that would have mattered most — a key that jittered between
+  fetches (a re-rounded coordinate, a revised magnitude) would ring the whole
+  map every sixty seconds. It does not.
+- **The 25-arrival figure is why the baseline is what it is.** Those 25 are
+  what a naive "diff against what is on the map" would have pulsed
+  simultaneously on the first auto-refresh, and the number grows every day the
+  bundled snapshot is not refreshed. `liveKeysRef` starting `null` is what
+  makes the first live fetch pulse nothing (D33).
+- **Cost.** A diff over 631 features is **0.35 ms**; building the next key set
+  is **0.25 ms**. Both run once a minute. The animation writes three scalars
+  per frame and no data.
+- **The pulse curve was sampled** rather than eyeballed — 5.0px/0.90α at 0ms,
+  19.5px/0.57α at 1s, 26.9px/0.30α at 2s, 29.6px/0.10α at 3s, 30.0px/0α at 4s.
+  It clears an M8.5 circle (24px) before it fades, and it clamps rather than
+  extrapolating outside `[0, 1]`.
+- **Phases 1, 2 and 4 are provably untouched.** `git diff --numstat` reports
+  `89 0` for `lib/mapbox.ts` and `36 0` for `app/globals.css` — every Phase 5
+  line is appended below what was there. `components/MapView.tsx` is `467 5`
+  and `components/DataPanel.tsx` is `90 3`; all eight deletions were inspected
+  and are doc-comment rewordings plus the four `setDataSource` →
+  `applyDataSource` renames. `lib/csv.ts`, `lib/geo.ts`, `lib/columns.ts`,
+  `lib/stats.ts`, `lib/upload.ts`, `lib/types.ts`, `Legend.tsx`,
+  `ColumnMapper.tsx`, `Select.tsx` and `SelectionPanel.tsx` do not appear in
+  the diff at all.
+- **The dev-only console helpers are provably absent from the production
+  build.** `npm run build`, then grepping every file under `.next/static`:
+  zero hits for `__seismicDropKeys`, `__seismicMap`, `baseline is now` or
+  `No live baseline`. The two apparent hits when grepping loosely are Next's
+  own "Dropped segment" router message and Mapbox's public `flyTo` method,
+  both checked in context. `process.env.NODE_ENV` is inlined at build time, so
+  the guard removes the code rather than skipping it.
+- **Phase 5 reaches the client bundle.** The built JS chunk carries
+  `quakes-pulse-ring`, `4.5_month.geojson`, `no-store`, `circle-stroke-opacity`,
+  "Refreshing", "Auto-refresh paused", "Fetching the latest" and "Live · USGS";
+  the CSS chunk carries `data-panel__dot`, the `data-panel-breathe` keyframes
+  and the `prefers-reduced-motion` guard. Document order in that chunk is
+  unchanged (see the `globals.css` note above).
+- **Not verifiable in the build environment (no WebGL):** the ring rendering,
+  the timer firing, and whether a pulse reads as calm or as a flash. All of
+  this was subsequently confirmed in a real browser on the deployed build —
+  see `docs/TESTING.md`. The pulse and the selection ring read as distinct on
+  the same quake even in the dense Indonesia cluster.
 
 ### Phase 4
 - `npm test` → **89 passed** (6 csv + 7 stats + 23 columns + 28 upload + 25
@@ -512,11 +803,12 @@ Everything in this section was actually run, in this environment.
   `options.controls.trash`, which `displayControlsDefault: false` leaves off.
   The digit-key mode shortcuts are gated the same way. "Clear" is the only way
   to remove a shape.
-- **Not measured here, and this is the point of the eyeball pass below:** the
-  actual smoothness of a drag. There is no WebGL in this environment, so the
-  cost of `setData` on the ring source and of the React render — the two
-  things the identity check exists to avoid on unchanged frames — has never
-  been observed. The turf recount is known to be cheap; those two are not.
+- **Not measurable in the build environment (no WebGL):** the actual
+  smoothness of a drag — the cost of `setData` on the ring source and of the
+  React render, the two things the identity check exists to avoid on unchanged
+  frames. Confirmed smooth in a real browser on the deployed build, including a
+  slow drag across the dense Indonesia cluster (see `docs/TESTING.md`). The
+  turf recount was already known to be cheap.
 - **Phase 4 reaches the client bundle**, not just the source tree. The built
   CSS chunk carries `mapbox-gl-draw_ctrl-draw-btn` and `mode-direct_select`
   (so Draw's sheet, including its cursor rules, is in), the minified
@@ -599,175 +891,6 @@ Everything in this section was actually run, in this environment.
 - Not verified here: anything needing a browser. There is no WebGL in this
   environment, so everything below is still unobserved.
 
-## Needs a human eyeball
-Nothing below was machine-verified. The code typechecks, builds, and its output
-is in the shipped bundle, but it has never been rendered.
-
-### The Phase 4 click-through
-This is the new one, and it is entirely unseen — the count arithmetic is
-tested, but no polygon has ever been drawn.
-
-1. **The resting state.** The right-hand stack should read, top to bottom:
-   mode toggle, a selection panel ("Draw area" and "Draw a polygon to
-   filter."), then the data panel. No "Clear" button yet. **Check the corners
-   for a small white smudge** — that would be Draw's empty control group
-   escaping the `:empty` rule, which is the one piece of chrome suppression
-   that could plausibly fail.
-2. **Draw one.** Click "Draw area"; it should take a tinted pressed state, the
-   cursor should become a crosshair over the map, and the readout should
-   switch to the corner-placing hint. Place corners, double-click to finish.
-   On finish: the button un-presses on its own (Draw's own mode change), the
-   readout becomes `N of 619 inside selection`, a "Clear" button appears, and
-   the quakes inside get white rings. Draw a box round Indonesia and the
-   number should be in the region of the headless figures above — 260 for
-   95…142 E, -11…8 N.
-3. **Edit vertices — this is the one to look at, and the follow-up changed
-   it.** Click the shape to get its handles (a single click if it is still
-   selected from drawing it, otherwise click to select then click again).
-   Drag a corner slowly across a dense arc — Japan or Indonesia is the test —
-   and **the count should tick continuously as you drag**, not jump on
-   release. Rings should appear and disappear under the moving edge in step
-   with the number.
-   - **Is it smooth or janky?** This is the question the follow-up exists to
-     answer and the one thing that could not be measured here. Watch the
-     *polygon outline* as much as the number: if the outline itself stutters
-     or lags behind the cursor, the per-frame recount is costing too much. If
-     the outline tracks the cursor cleanly and only the number is behind, that
-     is a different and much cheaper problem.
-   - Try it in both a sparse region (empty ocean — most frames change nothing,
-     so the identity check should make it free) and a dense one (Indonesia,
-     260 quakes — most frames change the set, so this is the worst case).
-   - If it is janky, the knobs in order: throttle `refreshSelectionLive` to
-     every other frame; or recount per frame but move the ring layer's
-     `setData` to release only, keeping the number live and the rings lagging.
-     D28 records why neither was done pre-emptively.
-   - Also drag a **midpoint** to add a corner, and drag the **whole shape**
-     from its interior — both go through the same per-frame path.
-4. **Clear.** The shape goes, the rings go, "Clear" disappears, and the
-   readout returns to "Draw a polygon to filter."
-5. **Redraw replaces.** With a shape on the map, click "Draw area" again. The
-   old shape should vanish immediately (the count clears with it) and a new
-   one starts. There should never be two shapes.
-6. **Cancel.** Click "Draw area", place one or two corners, press Escape. Draw
-   should abandon the shape and the button should un-press. Then click "Draw
-   area" and click it again without drawing — it should leave draw mode too.
-6b. **The mid-draw guard — the crux of the follow-up.** While placing corners,
-   move the mouse around with two or three corners already down. Draw keeps a
-   trailing vertex glued to the cursor, so there *is* a countable closed ring
-   in its store the whole time (D28). **The panel must keep showing the
-   corner-placing hint and must never flash a number** that swings around as
-   the mouse moves. The number should appear exactly once, when the shape is
-   finished. If a number flickers mid-draw, the mode guard is not holding.
-7. **Both modes.** With a shape drawn, switch to Heatmap. **The count should
-   keep working and keep updating; the rings should disappear; the polygon
-   outline should stay.** Switch back and the rings return. That asymmetry is
-   D25 and is the thing to confirm reads sensibly rather than as a bug.
-8. **Popups.** While drawing, click directly on a quake — it should place a
-   corner and **not** open a popup. With a finished shape on the map, clicking
-   a quake inside it should open a popup normally.
-9. **Draw then upload, and draw then reset.** With a shape on the map, upload
-   a CSV. The shape stays and the count recomputes against the new data
-   (D29). **Expect the awkward case and judge it:** an upload also re-frames
-   the map, so if the new data is somewhere else the polygon can end up
-   off-screen with the panel truthfully reading `0 of N inside selection`.
-   If that reads as broken rather than as honest, D29 records the alternative
-   (clear the shape on a data change) and why it was not taken. Reset to
-   sample and the same shape should give its original count back.
-10. **A weird shape.** Draw a concave, self-touching outline — a bow tie or a
-    star that crosses itself. It must not throw, and turf answers it by the
-    even-odd rule, so the count will follow the alternating in/out regions
-    rather than the visual "inside". That is tested in the abstract; this is
-    the check that Draw lets you make one at all.
-11. **Across the date line.** The default view is Pacific-centred, so this is
-    easy: draw a box around Tonga or the Kuriles spanning the date line, or
-    pan east past 180 and draw on the repeated world. The count must not be
-    zero — that is D27's whole reason for existing, and it is the failure the
-    unit tests were written against.
-12. **The dark theme.** The polygon outline, its fill and its vertex handles
-    should read as neutral white chrome, clearly not data. Check the outline
-    is dashed while being drawn and solid once finished, and that a vertex
-    handle sitting on top of a quake still reads as a ring rather than
-    swallowing the point.
-
-### The Phase 3 click-through
-1. **Sample.** Page loads, left panel reads `619 quakes · M4.5+ past month`
-   and the stats bar reads 619 / M 7.8 / 0–645 km. Right side shows the mode
-   toggle above a data panel saying "Sample · USGS M4.5+, past month", with no
-   "Reset to sample" button (there is nothing to reset from).
-2. **Upload, USGS-shaped.** Pick `public/sample-quakes.csv` itself. It should
-   load with no mapping UI at all, the subtitle should switch to
-   `619 quakes · sample-quakes.csv`, a notice should read "Loaded 619 points",
-   "Reset to sample" should appear, and the map should ease to fit the data.
-3. **Bad file.** A CSV with no usable coordinates (or the sample with its
-   `mag` column renamed and then mapped to `place`). Expect a warm-toned
-   notice, the previous points **still on the map**, and the stats bar
-   unchanged.
-4. **Column mapping.** A CSV whose columns are named anything else. The mapper
-   panel should open below the data panel, pre-filled where it can be, with
-   "Load" disabled until latitude/longitude/magnitude are all set.
-   - **The dropdown is the thing to look at**, since it is what the follow-up
-     replaced. Open one: the list must be dark with light text, and legible.
-     Check the selected row shows a tick and the row under the pointer
-     highlights.
-     - Keyboard, all from the closed button: Down/Up opens and moves, Home/End
-       jump, Enter or Space picks, Escape closes without picking, Tab closes
-       and moves on, and typing "l" repeatedly cycles through columns starting
-       with L. None of that is unit-tested (D9) — it is DOM behaviour, and this
-       is the check.
-   - Opening a dropdown low in the panel should scroll it into view inside the
-     panel, not push the panel over the map.
-5. **Bad file types.** Drop in a `.zip`, then a `.png`, then a `.csv` that is
-   really a renamed zip. Each should give one short line ("Couldn't read … —
-   please upload a .csv."), the map should keep its points, and **no binary
-   should appear anywhere in the panel**. The console is where the real error
-   goes.
-6. **Reset.** Returns to the sample, eases back to the opening Pacific view,
-   the "Reset to sample" button disappears again.
-7. **Both modes on uploaded data.** Toggle to Heatmap while an upload is
-   displayed; it should just work — same source, no refetch, no flicker. Then
-   toggle back and click a point: the popup should show the uploaded file's
-   place string, escaped.
-8. **The legend.** Bottom of the left stack. It should switch content with the
-   mode, collapse and expand, and stay small enough not to dominate.
-
-### Layout, after the follow-up
-The overlap is fixed structurally rather than by tuning numbers — two columns
-of one grid cannot overlap each other at any width — but the arithmetic below
-has still never been rendered.
-
-- **The overlap case itself.** Open the mapper on a desktop window and confirm
-  the columns stay apart. The grid is `minmax(0, 17rem)` and `minmax(0, 16rem)`
-  with `space-between`, so the two columns plus padding and gap need 36rem
-  (576px) and shrink rather than collide below that.
-- **The tall mapper.** With all six dropdowns and one open, the panel should
-  scroll inside itself and stop at 26rem, never running past the bottom of the
-  map. Only the mapper is allowed to shrink; the toggle and data panel keep
-  their size (`flex: none` on stack children, overridden for `.mapper`).
-- **Narrow viewports.** Under 46rem (736px) the grid becomes one column: title
-  and stats, legend, toggle, data panel, mapper. While the mapper is open the
-  legend is hidden — that is the `map-overlay--mapping` class doing its job,
-  and it is worth confirming it comes back when the mapper closes. This is a
-  not-broken layout, not a designed one.
-- **A long file name** in the subtitle and the source label. Now clamped to 42
-  characters by `safeFileName` as well as `word-break`, unverified.
-- **The stats bar's longest `place`** wrapping inside the panel instead of
-  stretching it — still the Phase 2 open question.
-
-### Carried from Phase 2, still unseen
-- **The retuned heatmap.** At zoom 1.4 the model predicts: sparse ocean quakes
-  as a dim ember barely above the basemap, Alaska deep orange, Chile orange,
-  Tonga and Japan bright amber, Indonesia and the Philippines near-white cores
-  — the Sunda arc core about 18px across, glow fading by 46px. If it reads
-  cold, raise `heatmap-intensity`'s z0/z1.5 stops (0.3 / 0.36) together; if the
-  arcs melt into one mass, lower `heatmap-radius`'s z0/z2 stops (18 / 24).
-  Change one at a time — they pull against each other.
-- Whether the model's density figures match what the GPU actually draws.
-- That the toggle visibly swaps the layers with no frame showing both or
-  neither.
-- That popups and the pointer cursor go quiet in Heatmap mode and return in
-  Points mode.
-- Behaviour above zoom 6, which the Phase 2 fitting only spot-checked.
-
 ## Investigated and NOT a bug: the circle layer in Heatmap mode
 Two hard-edged orange discs near Indonesia and the Philippines were reported in
 Phase 2 as the circle layer failing to hide. It was not. `MapView` adds exactly
@@ -791,7 +914,25 @@ our more-specific `.mapboxgl-popup .mapboxgl-popup-content`, read in document
 order. No `!important` anywhere.
 
 ## Does not exist yet
-- No live refresh or pulse animation (Phase 5).
+**The roadmap is complete.** What is listed here is what was never in it.
+
+- **No control over the refresh interval**, and no way to turn auto-refresh off
+  while live data is showing. 60 seconds matches the feed's own cache, and
+  uploading a file is the only way to stop it. A pause toggle would be a fifth
+  thing in the data panel.
+- **No history.** The map shows the current state of the feed; a quake that
+  rolls off the month window disappears with no announcement, and there is no
+  record that it was ever there. `findNewQuakes` deliberately ignores
+  departures.
+- **The pulse is not queued.** A refresh that lands while a previous cohort is
+  still fading replaces it, so a ring can be cut short in the rare case of two
+  arrivals inside four seconds. Deliberate — it is what stops pulses
+  accumulating (D34) — but it is a real behaviour, not an oversight.
+- **No magnitude in the pulse.** Every arrival gets the same ring, whether it
+  is M4.5 or M8. D34 argues for that; a size- or duration-scaled pulse would be
+  the obvious next iteration if it ever reads as too flat.
+- **No sound, no notification, no title-bar count** for an arrival. The map is
+  the whole of the signal.
 - No polygon beyond one at a time, and no way to combine or subtract shapes.
   One shape, one count (D28).
 - The selection filters nothing but the count and the rings. The stats bar
@@ -806,4 +947,4 @@ order. No `!important` anywhere.
 - No persistence: an uploaded file lives in the browser tab and is gone on
   reload. Nothing is sent anywhere; the CSV never leaves the machine.
 - No responsive breakpoints. The overlays are positioned for a desktop
-  viewport (see the layout risks above).
+  viewport (the narrow-width behaviour is documented in `docs/TESTING.md`).
