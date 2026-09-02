@@ -220,3 +220,167 @@ export const MAGNITUDE_LEGEND_STOPS: ReadonlyArray<{ mag: number; px: number }> 
   { mag: 6, px: 13 },
   { mag: 7.5, px: 22 },
 ];
+
+/* ---------------------------------------------------------------------------
+   Phase 4 — the drawn selection
+
+   Everything below is additive: a second source, a layer that rings whichever
+   points fall inside the drawn shape, and the theme Mapbox Draw paints itself
+   with. Nothing above this line moves. The selection is a *third* thing on the
+   map and it has to read as one — see docs/DECISIONS.md D25 for why it is
+   drawn in neutral chrome colours rather than in either data palette.
+   --------------------------------------------------------------------------- */
+
+/** id of the source holding only the quakes inside the drawn polygon. */
+export const SELECTED_SOURCE_ID = "quakes-selected";
+/** id of the ring layer drawn from {@link SELECTED_SOURCE_ID}. */
+export const SELECTED_LAYER_ID = "quakes-selected-ring";
+
+/** Empty until a polygon exists; fed by the same setData path as the quakes. */
+export const QUAKE_SELECTED_SOURCE: GeoJSONSourceSpecification = {
+  type: "geojson",
+  data: EMPTY_COLLECTION,
+};
+
+/**
+ * A ring around each selected quake, drawn above the circle layer.
+ *
+ * It is a ring and not a re-fill on purpose: the circle underneath keeps its
+ * depth colour, so the selection says "this one is in" without overwriting
+ * what the point already meant. The radii mirror `QUAKE_CIRCLE_LAYER`'s with a
+ * constant 2.5px added — the same restate-rather-than-derive call D20 made for
+ * the legend, for the same reason, and with the same obligation: **if the
+ * circle layer's radius stops move, move these too.**
+ *
+ * Hidden in Heatmap mode by the toggle. The count still works there; the ring
+ * does not, because a heatmap deliberately has no individual points to ring.
+ */
+export const QUAKE_SELECTED_LAYER: CircleLayerSpecification = {
+  id: SELECTED_LAYER_ID,
+  type: "circle",
+  source: SELECTED_SOURCE_ID,
+  layout: { visibility: "none" },
+  paint: {
+    "circle-radius": [
+      "interpolate",
+      ["linear"],
+      ["get", "mag"],
+      4.5, 5.5,
+      5.5, 7.5,
+      6.5, 11.5,
+      7.5, 17.5,
+      8.5, 26.5,
+    ],
+    // No fill at all — the quake's own circle shows through the middle.
+    "circle-opacity": 0,
+    "circle-stroke-width": 1.4,
+    "circle-stroke-color": "#f2f6fa",
+    "circle-stroke-opacity": 0.9,
+  },
+};
+
+/**
+ * One layer of Mapbox Draw's own styling. Draw takes `object[]` and injects
+ * the `source` itself (and clones each entry into a hot and a cold copy), so
+ * these cannot be `LayerSpecification`s — the shape below is as much checking
+ * as the option allows.
+ */
+type DrawStyle = {
+  id: string;
+  type: "fill" | "line" | "circle";
+  filter?: unknown[];
+  layout?: Record<string, unknown>;
+  paint: Record<string, unknown>;
+};
+
+/**
+ * Draw's default theme is a blue-and-orange that belongs to some other
+ * application, and its orange is within a shade of this map's shallow-depth
+ * and heatmap colours. So the selection is drawn in near-white chrome instead:
+ * nothing on this map encodes data in neutral white, which is exactly why the
+ * outline can use it without claiming to mean anything.
+ *
+ * Filters are Draw's own, unchanged — they are how Draw addresses its internal
+ * feature/vertex/midpoint bookkeeping, and are not ours to reinterpret. Only
+ * the paint differs. The point layers of the default theme are left out: the
+ * only mode this app enables is polygon drawing.
+ */
+const SELECTION_INK = "#f2f6fa";
+
+export const DRAW_STYLES: DrawStyle[] = [
+  {
+    id: "gl-draw-polygon-fill",
+    type: "fill",
+    filter: ["all", ["==", "$type", "Polygon"]],
+    paint: {
+      "fill-color": SELECTION_INK,
+      // Barely there. The polygon's job is to bound the count, not to hide
+      // the quakes the count is about.
+      "fill-opacity": [
+        "case",
+        ["==", ["get", "active"], "true"], 0.1,
+        0.06,
+      ],
+    },
+  },
+  {
+    id: "gl-draw-lines",
+    type: "line",
+    filter: ["any", ["==", "$type", "LineString"], ["==", "$type", "Polygon"]],
+    layout: { "line-cap": "round", "line-join": "round" },
+    paint: {
+      "line-color": SELECTION_INK,
+      "line-opacity": 0.85,
+      // Dashed while the shape is live, solid once it is settled — the same
+      // convention Draw's own theme uses, and the only cue that the outline
+      // under the cursor is still being drawn.
+      "line-dasharray": [
+        "case",
+        ["==", ["get", "active"], "true"], ["literal", [0.4, 2]],
+        ["literal", [1, 0]],
+      ],
+      "line-width": 1.6,
+    },
+  },
+  {
+    id: "gl-draw-vertex-outer",
+    type: "circle",
+    filter: [
+      "all",
+      ["==", "$type", "Point"],
+      ["==", "meta", "vertex"],
+      ["!=", "mode", "simple_select"],
+    ],
+    paint: {
+      "circle-radius": ["case", ["==", ["get", "active"], "true"], 6, 4.5],
+      "circle-color": SELECTION_INK,
+    },
+  },
+  {
+    // The dark centre is what turns the handle into a ring rather than a
+    // blob, so a vertex sitting on a quake does not swallow it.
+    id: "gl-draw-vertex-inner",
+    type: "circle",
+    filter: [
+      "all",
+      ["==", "$type", "Point"],
+      ["==", "meta", "vertex"],
+      ["!=", "mode", "simple_select"],
+    ],
+    paint: {
+      "circle-radius": ["case", ["==", ["get", "active"], "true"], 3.5, 2.4],
+      "circle-color": "#0b0f14",
+    },
+  },
+  {
+    // Midpoints are an invitation, not a state — dimmer than a real vertex.
+    id: "gl-draw-midpoint",
+    type: "circle",
+    filter: ["all", ["==", "meta", "midpoint"]],
+    paint: {
+      "circle-radius": 2.6,
+      "circle-color": SELECTION_INK,
+      "circle-opacity": 0.55,
+    },
+  },
+];

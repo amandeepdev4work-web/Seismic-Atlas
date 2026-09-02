@@ -1,11 +1,46 @@
 # Current State
 
-_Last updated: Phase 3 follow-up — upload guard, custom dropdown, overlay grid_
+_Last updated: Phase 4 follow-up — per-frame live counting while dragging_
 
-Phases 1, 2 and 3 are built and machine-verified as far as this environment
-allows: `npm test` (64 passing), `npm run typecheck` and `npm run build` are
+Phases 1 through 4 are built and machine-verified as far as this environment
+allows: `npm test` (89 passing), `npm run typecheck` and `npm run build` are
 all clean, and the production build ships the new controls in both the CSS and
 the JS chunks.
+
+Phase 4 puts a drawing tool on the map. Draw a polygon and the panel says how
+many of the loaded quakes are inside it, recomputing as the shape is created,
+edited or removed, and the quakes inside get a neutral white ring. It works on
+uploaded data for the same structural reason Heatmap mode does: the count is
+taken against `featuresRef`, which is set by `showFeatures` — the one path
+through which anything reaches the source (D19) — so upload, reset and any
+future data path are covered without a second wire.
+
+**The Phase 4 follow-up** made the count update per frame rather than on
+mouse-up. Nothing about the counting changed — `lib/geo.ts` and its 25 tests
+are byte-identical — only *when* it is called: `draw.render` is wired
+alongside the three edge events, guarded on Draw's mode so a shape still being
+drawn shows no number. The guard has to be the mode and cannot be geometric,
+which is the one genuinely surprising thing in this phase and is written up in
+D28. Two writes (the ring layer's `setData` and the panel's `setState`) are
+skipped on frames where the inside set is unchanged, which is what keeps a
+drag cheap without throttling anything.
+
+The arithmetic lives in a new pure module, `lib/geo.ts`, which is where the 25
+new tests point. The drawing itself is not tested and will not be (D9/D28).
+Two things about the geometry turned out to matter more than expected and are
+worth reading before touching this: the date line is in the middle of the
+default frame, so a shape drawn around Tonga arrives with longitudes past 180
+while the quakes it encloses are stored below -180 (D27); and turf throws on
+most malformed rings, which is the normal state of a shape mid-drawing (D28).
+
+Phases 1 and 2 are again provably untouched: `git diff` reports **0 deletions**
+in `lib/mapbox.ts` (164 additions, all appended below the existing layers) and
+**0 deletions** in `app/globals.css` (27 additions). The circle and heatmap
+paint values did not move, are not re-painted at runtime, and are not filtered
+— the selection highlight is its own source and its own layer drawn above them
+(D25). The parser, the popup content, the legend, the mapper and the upload
+path were not touched at all; the only change to the popup is a guard on *when*
+it opens (D26).
 
 Phase 3 adds a second way for data to reach the map. A user can upload their
 own CSV; it goes through the *same* `parseQuakeCsv`, the same GeoJSON source
@@ -108,13 +143,54 @@ nothing outside the upload path, the mapper and the overlay CSS:
     entirely binary.
   - `FILE_INPUT_ACCEPT` — what the picker advertises. A convenience, never the
     check: `accept` is trivially bypassed by choosing "All files".
-- `lib/mapbox.ts` — unchanged through `QUAKE_HEATMAP_LAYER`; see the Phase 2
-  notes below. Phase 3 **appended** `MapMode` (`"points" | "heatmap"`, moved
-  out of `MapView` so the legend can take it as a prop) and three legend
+- `lib/geo.ts` — **new in Phase 4**, and the only thing Phase 4 unit-tests.
+  `countPointsInPolygon(features, polygon): { inside, insideFeatures }`. Pure:
+  no map, no DOM, no globals, the same rule `parseQuakeCsv` and `computeStats`
+  follow. Takes a bare `Polygon`, a `MultiPolygon`, a `Feature` wrapping
+  either, or `null`/`undefined`. `insideFeatures` holds the very same feature
+  objects in input order, because the ring layer needs the features and not
+  copies. Three contracts, each with tests (D28):
+  - **On the boundary is inside.** Edges and vertices both. That is turf's
+    default and it is kept deliberately, not inherited by accident.
+  - **Nothing throws.** Turf throws on an empty ring, a two-point ring, or a
+    ring whose last position does not repeat its first — all of which are
+    ordinary states of a shape being drawn. Those are screened out and
+    answered with zero; a merely-unclosed ring is closed rather than refused;
+    a feature with a non-numeric coordinate is skipped, not fatal.
+  - **Every copy of the world.** A shape reaching past ±180 tests each point
+    at ±360 too, stopping at the first copy that lands inside so nothing is
+    double-counted (D27). A shape inside one world pays nothing for this.
+
+  Internally it computes the outer bounding box once per call and uses it both
+  to decide which shifts are needed and as a cheap reject before each ray
+  cast. Import is `booleanPointInPolygon` from `@turf/turf`; the meta-package
+  tree-shakes (verified below).
+- `lib/mapbox.ts` — unchanged through `MAGNITUDE_LEGEND_STOPS`; see the Phase 2
+  and Phase 3 notes. Phase 3 **appended** `MapMode` (`"points" | "heatmap"`,
+  moved out of `MapView` so the legend can take it as a prop) and three legend
   constants that mirror the layers' paint values: `DEPTH_LEGEND_STOPS`,
   `DENSITY_LEGEND_STOPS`, `MAGNITUDE_LEGEND_STOPS`. They restate rather than
   derive, deliberately (D20), and sit directly beneath the layers they
   describe with a keep-in-sync note.
+
+  Phase 4 **appended** again, 164 lines and no deletions:
+  - `SELECTED_SOURCE_ID` / `SELECTED_LAYER_ID`, `QUAKE_SELECTED_SOURCE` (empty
+    to start, like the quake source) and `QUAKE_SELECTED_LAYER` — a circle
+    layer with no fill (`circle-opacity: 0`) and a 1.4px `#f2f6fa` stroke, so
+    a selected quake gets a ring and keeps its depth colour underneath. Its
+    radii are the circle layer's plus a constant 2.5px, **restated, with the
+    same keep-in-sync obligation D20 put on the legend swatches.** It starts
+    `visibility: none` and follows Points mode.
+  - `DRAW_STYLES` — Mapbox Draw's theme, recoloured. Draw's filters are copied
+    unchanged (they address Draw's own feature/vertex/midpoint bookkeeping);
+    only the paint differs, and it is all `#f2f6fa` chrome rather than either
+    data palette (D25). Polygon fill at 6% (10% while active), a 1.6px outline
+    dashed while the shape is live, vertex handles drawn as a white disc with
+    a `#0b0f14` centre so a handle over a quake does not swallow it, and
+    dimmer midpoints. The default theme's Point-feature layers are left out —
+    polygon is the only mode this app enables. Typed as a local `DrawStyle`
+    shape rather than a `LayerSpecification`, because Draw injects `source`
+    itself and clones each entry into a hot and a cold copy.
 - `lib/stats.ts` — unchanged. `computeStats(features): QuakeStats`, pure,
   single pass, every aggregate nullable (D14). Phase 3 reuses it verbatim: it
   is recomputed once per successful load, sample or upload, on the same
@@ -170,6 +246,73 @@ fitted against a model of Mapbox's shader — see D15.
     mapper is open, which is what the narrow-width rule keys off.
   - The mode toggle effect is untouched: two `setLayoutProperty` calls guarded
     by `getLayer`, keyed on `[mode, layersReady]` (D12).
+
+  What Phase 4 added, all of it around the existing structure rather than
+  through it:
+  - **Four more refs.** `drawRef` holds the `MapboxDraw` instance, beside the
+    map and for the same reason (D3). `featuresRef` holds whatever is on the
+    map right now — it is the array the count is taken against, and it is set
+    in exactly the two places the source is fed, `loadSample` and
+    `showFeatures`. `drawingRef` mirrors the `drawing` state for the popup
+    handler, which is wired once on `load` and so cannot see later renders.
+    `ringedRef` (follow-up) holds the features the ring layer was last fed, so
+    a frame that changed nothing does not pay to re-upload identical geometry.
+  - **`wireDrawing(map)`**, called from the `load` handler after the layers, so
+    Draw's outline and handles sit above every data layer. It constructs Draw
+    with `displayControlsDefault: false` (D26), `boxSelect: false` (so
+    shift-drag stays the map's box zoom) and `DRAW_STYLES`, adds it as a
+    control, and binds five listeners. `draw.create` / `draw.update` /
+    `draw.delete` all call `refreshSelection` **unguarded**; `draw.render`
+    calls `refreshSelectionLive`, which is the same thing behind a mode guard;
+    `draw.modechange` asks Draw for its mode rather than reading the event, so
+    there is one answer to "are we drawing?". **Every listener reads only refs
+    and state setters**, which is what makes binding them once on `load` safe.
+  - **`refreshSelection()`** — reads the polygon back out of Draw, counts,
+    feeds the ring source, and sets the panel state. With no polygon it clears
+    both. This is the only thing that changes the selection. Since the
+    follow-up it also skips the two expensive writes when the inside set is
+    identical to last time, compared by identity against `ringedRef` — sound
+    because `countPointsInPolygon` returns the very features it was given.
+  - **`refreshSelectionLive()`** — the per-frame path, added in the follow-up.
+    One guard: skip while `getMode()` is `draw_polygon`. It cannot be a
+    geometric guard, because Draw closes every ring on the way out of
+    `getCoordinates`, so a half-drawn shape is indistinguishable from a
+    finished one by inspection; see D28. The three edge events stay unguarded
+    because `draw.create` fires while the mode name still says `draw_polygon`.
+  - **`handleDraw` / `handleClearSelection`.** Drawing calls `deleteAll` first,
+    so one shape exists at a time and the code reading it back can take the
+    first polygon it finds. Both call `refreshSelection` themselves, because
+    Draw fires no events for its own API calls (`suppressAPIEvents` is on by
+    default) — `deleteAll` is silent, and so is a programmatic `changeMode`.
+  - **`showFeatures` calls `refreshSelection`** after `setData`, which is what
+    makes an upload or a reset recount against the new data rather than
+    clearing the shape (D29).
+  - **The mode effect gained a third branch**, guarded by `getLayer` like the
+    other two: the ring follows Points mode. The count keeps working in
+    Heatmap mode; the ring does not, and D25 says why.
+  - **The popup handler gained one guard** — `if (drawing.current) return;` —
+    so a click that lands on a quake while a shape is being drawn places a
+    corner without also opening a popup over it. Content, escaping and styling
+    are untouched.
+  - **The effect cleanup drops `drawRef`**, because `map.remove()` calls every
+    control's `onRemove` and leaves Draw's internals torn down; a late refresh
+    would otherwise ask a gutted Draw for its features.
+- `components/SelectionPanel.tsx` — **new in Phase 4.** "Draw area", "Clear"
+  (only while a shape exists), and the count. Buttons reuse
+  `.data-panel__button`, the pill language the data panel and the mapper
+  already share, so this reads as one more control rather than a new kind of
+  thing. "Draw area" holds a pressed state keyed off `aria-pressed` — a mode,
+  not a click — and it toggles: pressing it again leaves draw mode.
+  The readout is one `aria-live="polite"` line with three states: the count
+  (`87` in the foreground, `of 619 inside selection` muted), the drawing hint
+  ("Click to place corners, double-click to finish. Esc cancels."), or the
+  neutral prompt ("Draw a polygon to filter."). A second, dimmer line appears
+  only alongside the count: "Click the shape to move its corners." Draw hides
+  vertex handles until a shape is selected, and the count updating as a corner
+  is dragged is the whole trick, so the line that would otherwise be blank
+  says where to find the handles. The control and the number are in the same
+  panel deliberately — D26 argues that against putting the count in the stats
+  bar.
 - `components/DataPanel.tsx` — **new.** Upload button, "Reset to sample"
   (shown only when uploaded data is displayed), the current source label, and
   the dismissible notice. The picker is a hidden `<input type="file">` driven
@@ -200,8 +343,12 @@ fitted against a model of Mapbox's shader — see D15.
   not how deep or how big. This is what makes the two meanings of colour
   stated rather than merely mutually exclusive (D20).
 - `app/page.tsx` — renders `<MapView />` full-viewport (`100dvh`).
-- `app/layout.tsx` — root layout and the single entry point for CSS:
-  `mapbox-gl/dist/mapbox-gl.css` then `./globals.css`, in that order (D10).
+- `app/layout.tsx` — root layout and the single entry point for CSS. Phase 4
+  added a third sheet in the middle: `mapbox-gl.css`, then
+  `@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css`, then `./globals.css`, in
+  that order (D10). Draw's sheet is mostly the button bar we suppress, but it
+  also carries the cursor rules — crosshair while placing corners, a grab hand
+  over a vertex — which are most of what makes drawing feel like drawing.
 - `app/globals.css` — everything from Phases 1-2 is still byte-identical.
   Phase 3 added `color-scheme: dark` on `:root` (still worth having, for
   scrollbars and native chrome, though the dropdown no longer relies on it),
@@ -212,6 +359,17 @@ fitted against a model of Mapbox's shader — see D15.
   styles so that a media query could override it), and the `.map-overlay`
   layout with its `max-width: 46rem` rule. As before, only what inline styles
   cannot express lives in CSS - states, and now media queries.
+
+  Phase 4 appended 27 lines and deleted none: `.data-panel__button
+  [aria-pressed="true"]`, a tinted pressed state for "Draw area" (tinted
+  rather than merely brighter, because while it is on a click on the map does
+  something different); and `.mapboxgl-ctrl-group.mapboxgl-ctrl:empty {
+  display: none }`. That second one is load-bearing —
+  `displayControlsDefault: false` suppresses Draw's buttons but *not* the
+  container they would have gone in, and mapbox-gl.css gives an empty control
+  group a white background and a shadow, which is a pale smudge in a corner.
+  `:empty` is the whole condition, so a control group with buttons in it is
+  left alone.
 
 ### Tests
 - `vitest.config.mts` — node environment (no jsdom: nothing under test touches
@@ -245,20 +403,44 @@ fitted against a model of Mapbox's shader — see D15.
   non-numeric, good rows kept alongside bad, a mapping naming an absent column,
   an incomplete mapping reported once, and the default equalling
   `USGS_MAPPING`).
-- The upload UI, the dropdowns and the map are deliberately untested (D9).
-  Note what that means after the follow-up: `checkUploadFile`, `looksBinary`
-  and the clamps are covered because they are pure functions, but `Select`'s
-  keyboard handling is not — it is DOM behaviour, and testing it would mean the
-  jsdom setup D9 declined. It is on the eyeball list instead, with the specific
-  keys to press.
+- `tests/geo.test.ts` — **new in Phase 4**, 25 tests over `lib/geo.ts` only:
+  points clearly inside a 0–10 square and clearly outside it; a mixed set
+  keeping input order and returning the *same objects*; the boundary rule
+  (edges, vertices, and a hair either side of an edge at 1e-6); the zero
+  cases (empty feature set, `null`/`undefined` polygon, `null`/`undefined`
+  features, a polygon with no rings, an empty ring, a two-point ring, a ring
+  holding `NaN`, a feature holding `NaN`) — every one of which makes turf
+  throw if handed to it raw; the shapes a caller might pass (a `Feature`
+  wrapper, an unclosed ring that gets closed, a `MultiPolygon` counted across
+  both parts, a hole that excludes what is in it, and a self-touching bow tie
+  answered by the even-odd rule); the date line, both ways round and with a
+  wrapped point counted exactly once; and a 29-feature global set filtered to
+  a 25-point region.
+- The upload UI, the dropdowns, the drawing and the map are deliberately
+  untested (D9). Note what that means: `checkUploadFile`, `looksBinary`, the
+  clamps and now `countPointsInPolygon` are covered because they are pure
+  functions, but `Select`'s keyboard handling and every Draw event are not —
+  they are DOM and WebGL behaviour, and testing them would mean the jsdom
+  setup D9 declined plus mocking Draw's event plumbing. They are on the
+  eyeball list instead, with the specific things to press and drag.
 
 ## Dependencies
-**Unchanged.** Phase 3 added no runtime and no dev dependencies — `git diff`
-touches neither `package.json` nor `package-lock.json`. Runtime is still
+**Unchanged, again.** Phase 4 added no runtime and no dev dependencies —
+`git diff` touches neither `package.json` nor `package-lock.json`. Runtime is
 `next`, `react`, `react-dom`, `mapbox-gl`, `papaparse`, `@turf/turf`,
-`@mapbox/mapbox-gl-draw`; dev still adds `vitest` and `@types/geojson`.
-`@turf/turf` and `@mapbox/mapbox-gl-draw` remain installed and unused, for
-Phase 4.
+`@mapbox/mapbox-gl-draw`; dev adds `vitest`, `@types/geojson` and
+`@types/mapbox__mapbox-gl-draw`.
+
+What changed is that the last two runtime deps are finally *used*. Both earn
+their keep as D21 predicted they would:
+- `@mapbox/mapbox-gl-draw` 1.5.1, added as a map control with its own button
+  bar suppressed (D26).
+- `@turf/turf` 7.4.0, for `booleanPointInPolygon` only. **The meta-package
+  tree-shakes**: the built chunks contain no `voronoi`, no `tesselate`, no
+  `@turf/clusters`, no `bezierSpline`. D21's reason for *not* reaching for it
+  in Phase 3 — six lines of bbox arithmetic are not worth a meta-package — has
+  not been undermined; the geometry here is real, and only the part that is
+  real got bundled.
 
 ## Scripts
 - `npm run dev` — dev server (Turbopack) on http://localhost:3000
@@ -268,13 +450,98 @@ Phase 4.
 - `npm run build` / `npm run start` — production build and serve
 
 ## Verified
-Everything in this section was actually run, in this environment, at the end
-of the Phase 3 follow-up.
+Everything in this section was actually run, in this environment.
 
+### Phase 4
+- `npm test` → **89 passed** (6 csv + 7 stats + 23 columns + 28 upload + 25
+  geo). `npm run typecheck` → clean. `npm run build` → compiled, 3 static
+  pages, no warnings. The build prerendering at all is itself the evidence
+  that importing Mapbox Draw at module scope survives SSR.
+- **Phases 1 and 2 are provably untouched.** `git diff --numstat` reports
+  `164 0` for `lib/mapbox.ts` and `27 0` for `app/globals.css` — every Phase 4
+  line is appended below what was there. `components/MapView.tsx` is `184 2`,
+  and both deletions are the `wireInteractions` signature growing a second
+  parameter. `app/layout.tsx` is `9 4`, and all four deletions are a reworded
+  comment above the imports.
+- **The count was run headlessly over the real 619-row sample**, through the
+  real `parseQuakeCsv`. Regions, drawn as bounding boxes:
+
+  | Region | Box | Inside |
+  |---|---|---|
+  | Indonesia | 95…142 E, -11…8 N | 260 of 619 |
+  | Japan / Kuril | 128…150 E, 28…48 N | 39 of 619 |
+  | Chile / Peru | -76…-66, -45…-16 | 20 of 619 |
+  | Alaska | -170…-140, 50…66 | 9 of 619 |
+  | Tonga / Fiji | 176…190, -26…-14 | 39 of 619 |
+  | Tonga / Fiji, written the other way | -184…-170, -26…-14 | 39 of 619 |
+  | Whole world | -180…180, -90…90 | 619 of 619 |
+  | Mid-Atlantic | -40…-20, 20…35 | 1 of 619 |
+
+  The two Tonga rows are the date-line fix demonstrated on real data, not in
+  the abstract: the same 39 quakes whichever copy of the world the box is
+  drawn on (D27). The whole-world row is the sanity check that nothing is
+  silently dropped.
+- **Performance.** A recount is 0.09–0.76 ms depending on how much of the
+  world the box covers. A hundred worst-case recounts — the whole world plus
+  both longitude shifts, all 619 points — take **17.7 ms in total**, so a
+  recount is comfortably inside a frame and there was never a reason to reach
+  for a spatial index.
+
+### The Phase 4 follow-up (per-frame counting)
+- `npm test` → **89 passed**, unchanged; `lib/geo.ts` and `tests/geo.test.ts`
+  are byte-identical, since the follow-up only changed when the function is
+  called. `npm run typecheck` → clean. `npm run build` → clean, and
+  `draw.render` is present in the built client chunk.
+- **Draw's own event plumbing was read rather than assumed**, and three facts
+  from it are what the design rests on:
+  - `store.render()` wraps its work in a `requestAnimationFrame` and
+    deduplicates, so `draw.render` fires **at most once per frame**. There was
+    nothing left for us to throttle.
+  - `store.render()` is called from `mode_handler.delegate`, i.e. only when a
+    Draw mode actually handles an event — **not** on map pan or zoom. And both
+    settled modes return `skipRender` from `onMouseMove`, so merely hovering
+    over the map fires nothing. The event is therefore a change signal, not a
+    ticker.
+  - `Polygon.prototype.getCoordinates` returns `coords.concat([coords[0]])` —
+    **every ring is closed on the way out**, half-drawn or not. This is why
+    the guard cannot be geometric and must be the mode (D28).
+- **No feedback loop.** The per-frame handler writes to `quakes-selected`, our
+  own source; Draw's render event is driven by Draw's own store, which that
+  write does not touch.
+- Backspace/Delete are inert on the shape: Draw gates its trash keybinding on
+  `options.controls.trash`, which `displayControlsDefault: false` leaves off.
+  The digit-key mode shortcuts are gated the same way. "Clear" is the only way
+  to remove a shape.
+- **Not measured here, and this is the point of the eyeball pass below:** the
+  actual smoothness of a drag. There is no WebGL in this environment, so the
+  cost of `setData` on the ring source and of the React render — the two
+  things the identity check exists to avoid on unchanged frames — has never
+  been observed. The turf recount is known to be cheap; those two are not.
+- **Phase 4 reaches the client bundle**, not just the source tree. The built
+  CSS chunk carries `mapbox-gl-draw_ctrl-draw-btn` and `mode-direct_select`
+  (so Draw's sheet, including its cursor rules, is in), the minified
+  `data-panel__button[aria-pressed=true]` rule and
+  `.mapboxgl-ctrl-group.mapboxgl-ctrl:empty`. Read in document order the
+  chunk goes mapbox-gl.css (offset 2318) → mapbox-gl-draw.css (40991) →
+  globals.css (45514) → our `:empty` rule (52019), so the D10 ordering still
+  holds with a third sheet in it. The client JS chunk carries "Draw area",
+  "Draw a polygon to filter", "inside selection", `quakes-selected`,
+  `draw_polygon`, `draw.modechange`, `displayControlsDefault` and
+  `gl-draw-polygon-fill`.
+- **Turf tree-shakes.** No `voronoi`, `tesselate`, `@turf/clusters` or
+  `bezierSpline` anywhere in the built chunks.
+- Turf's own behaviour was probed directly rather than assumed, and every
+  contract in D28 comes from what it actually did: boundary points and
+  vertices return `true`; an empty ring, a two-point ring and an unclosed ring
+  all **throw**; a `Feature` wrapper, a `MultiPolygon` and a hole all behave;
+  and a polygon spanning 170…190 returns `false` for a point at -175 and
+  `true` for the same point written as 185.
+
+### Phase 3 and the follow-up
 - `npm test` → **64 passed** (6 csv + 7 stats + 23 columns + 28 upload).
   `npm run typecheck` → clean. `npm run build` → compiled, 3 static pages, no
   warnings.
-- The Phase 1/2 code is provably untouched: 0 deletions in `lib/mapbox.ts`
+- The Phase 1/2 code was provably untouched: 0 deletions in `lib/mapbox.ts`
   (47 additions, all appended) and 0 deletions in `app/globals.css`, and the 6
   Phase 1 parser tests pass unedited.
 - Phase 3 and the follow-up reach the client bundle, not just the source tree.
@@ -335,6 +602,92 @@ of the Phase 3 follow-up.
 ## Needs a human eyeball
 Nothing below was machine-verified. The code typechecks, builds, and its output
 is in the shipped bundle, but it has never been rendered.
+
+### The Phase 4 click-through
+This is the new one, and it is entirely unseen — the count arithmetic is
+tested, but no polygon has ever been drawn.
+
+1. **The resting state.** The right-hand stack should read, top to bottom:
+   mode toggle, a selection panel ("Draw area" and "Draw a polygon to
+   filter."), then the data panel. No "Clear" button yet. **Check the corners
+   for a small white smudge** — that would be Draw's empty control group
+   escaping the `:empty` rule, which is the one piece of chrome suppression
+   that could plausibly fail.
+2. **Draw one.** Click "Draw area"; it should take a tinted pressed state, the
+   cursor should become a crosshair over the map, and the readout should
+   switch to the corner-placing hint. Place corners, double-click to finish.
+   On finish: the button un-presses on its own (Draw's own mode change), the
+   readout becomes `N of 619 inside selection`, a "Clear" button appears, and
+   the quakes inside get white rings. Draw a box round Indonesia and the
+   number should be in the region of the headless figures above — 260 for
+   95…142 E, -11…8 N.
+3. **Edit vertices — this is the one to look at, and the follow-up changed
+   it.** Click the shape to get its handles (a single click if it is still
+   selected from drawing it, otherwise click to select then click again).
+   Drag a corner slowly across a dense arc — Japan or Indonesia is the test —
+   and **the count should tick continuously as you drag**, not jump on
+   release. Rings should appear and disappear under the moving edge in step
+   with the number.
+   - **Is it smooth or janky?** This is the question the follow-up exists to
+     answer and the one thing that could not be measured here. Watch the
+     *polygon outline* as much as the number: if the outline itself stutters
+     or lags behind the cursor, the per-frame recount is costing too much. If
+     the outline tracks the cursor cleanly and only the number is behind, that
+     is a different and much cheaper problem.
+   - Try it in both a sparse region (empty ocean — most frames change nothing,
+     so the identity check should make it free) and a dense one (Indonesia,
+     260 quakes — most frames change the set, so this is the worst case).
+   - If it is janky, the knobs in order: throttle `refreshSelectionLive` to
+     every other frame; or recount per frame but move the ring layer's
+     `setData` to release only, keeping the number live and the rings lagging.
+     D28 records why neither was done pre-emptively.
+   - Also drag a **midpoint** to add a corner, and drag the **whole shape**
+     from its interior — both go through the same per-frame path.
+4. **Clear.** The shape goes, the rings go, "Clear" disappears, and the
+   readout returns to "Draw a polygon to filter."
+5. **Redraw replaces.** With a shape on the map, click "Draw area" again. The
+   old shape should vanish immediately (the count clears with it) and a new
+   one starts. There should never be two shapes.
+6. **Cancel.** Click "Draw area", place one or two corners, press Escape. Draw
+   should abandon the shape and the button should un-press. Then click "Draw
+   area" and click it again without drawing — it should leave draw mode too.
+6b. **The mid-draw guard — the crux of the follow-up.** While placing corners,
+   move the mouse around with two or three corners already down. Draw keeps a
+   trailing vertex glued to the cursor, so there *is* a countable closed ring
+   in its store the whole time (D28). **The panel must keep showing the
+   corner-placing hint and must never flash a number** that swings around as
+   the mouse moves. The number should appear exactly once, when the shape is
+   finished. If a number flickers mid-draw, the mode guard is not holding.
+7. **Both modes.** With a shape drawn, switch to Heatmap. **The count should
+   keep working and keep updating; the rings should disappear; the polygon
+   outline should stay.** Switch back and the rings return. That asymmetry is
+   D25 and is the thing to confirm reads sensibly rather than as a bug.
+8. **Popups.** While drawing, click directly on a quake — it should place a
+   corner and **not** open a popup. With a finished shape on the map, clicking
+   a quake inside it should open a popup normally.
+9. **Draw then upload, and draw then reset.** With a shape on the map, upload
+   a CSV. The shape stays and the count recomputes against the new data
+   (D29). **Expect the awkward case and judge it:** an upload also re-frames
+   the map, so if the new data is somewhere else the polygon can end up
+   off-screen with the panel truthfully reading `0 of N inside selection`.
+   If that reads as broken rather than as honest, D29 records the alternative
+   (clear the shape on a data change) and why it was not taken. Reset to
+   sample and the same shape should give its original count back.
+10. **A weird shape.** Draw a concave, self-touching outline — a bow tie or a
+    star that crosses itself. It must not throw, and turf answers it by the
+    even-odd rule, so the count will follow the alternating in/out regions
+    rather than the visual "inside". That is tested in the abstract; this is
+    the check that Draw lets you make one at all.
+11. **Across the date line.** The default view is Pacific-centred, so this is
+    easy: draw a box around Tonga or the Kuriles spanning the date line, or
+    pan east past 180 and draw on the repeated world. The count must not be
+    zero — that is D27's whole reason for existing, and it is the failure the
+    unit tests were written against.
+12. **The dark theme.** The polygon outline, its fill and its vertex handles
+    should read as neutral white chrome, clearly not data. Check the outline
+    is dashed while being drawn and solid once finished, and that a vertex
+    handle sitting on top of a quake still reads as a ring rather than
+    swallowing the point.
 
 ### The Phase 3 click-through
 1. **Sample.** Page loads, left panel reads `619 quakes · M4.5+ past month`
@@ -438,9 +791,16 @@ our more-specific `.mapboxgl-popup .mapboxgl-popup-content`, read in document
 order. No `!important` anywhere.
 
 ## Does not exist yet
-- No polygon draw / point-in-polygon count (Phase 4); `@turf/turf` and
-  `@mapbox/mapbox-gl-draw` are installed but still unused.
 - No live refresh or pulse animation (Phase 5).
+- No polygon beyond one at a time, and no way to combine or subtract shapes.
+  One shape, one count (D28).
+- The selection filters nothing but the count and the rings. The stats bar
+  still describes the whole loaded set, not the selection — "max magnitude
+  inside this box" would be a natural next step and `insideFeatures` already
+  hands `computeStats` exactly what it would need.
+- No way to export or copy what is inside a selection.
+- The polygon is not persisted and is not in the URL, so it is gone on reload
+  like everything else here.
 - No drag-and-drop onto the map, and no URL/remote-CSV loading — upload is the
   file picker only.
 - No persistence: an uploaded file lives in the browser tab and is gone on

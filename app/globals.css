@@ -252,6 +252,17 @@ body {
   background: rgba(255, 255, 255, 0.09);
 }
 
+/* "Draw area" is a mode, not a one-shot action, so it holds a pressed state
+   the way the mode toggle's segments do — keyed off the aria attribute, so
+   the accessible state and the visible one cannot drift apart. It is tinted
+   rather than merely brighter, because while it is on, clicks land on the
+   map instead of doing what they normally do. */
+.data-panel__button[aria-pressed="true"] {
+  color: var(--foreground);
+  border-color: rgba(160, 190, 230, 0.5);
+  background: rgba(160, 190, 230, 0.14);
+}
+
 .data-panel__button:disabled,
 .mapper__button:disabled {
   opacity: 0.45;
@@ -515,4 +526,20 @@ body {
   .map-overlay--mapping .mapper {
     max-height: 60dvh;
   }
+}
+
+/* ---------------------------------------------------------------------------
+   Mapbox Draw's own control bar
+
+   Draw is added with `displayControlsDefault: false`, which suppresses its
+   buttons — but not the container they would have gone in, so an empty
+   `.mapboxgl-ctrl-group` is still appended to a map corner, where
+   mapbox-gl.css gives it a white background and a shadow. That is a pale
+   smudge in a corner this layout has already spent, so the empty one is
+   hidden. `:empty` is the whole condition: a control group with buttons in
+   it is a different thing and is left alone.
+   --------------------------------------------------------------------------- */
+
+.mapboxgl-ctrl-group.mapboxgl-ctrl:empty {
+  display: none;
 }

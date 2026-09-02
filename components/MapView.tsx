@@ -3,9 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import type { GeoJSONSource } from "mapbox-gl";
+import MapboxDraw from "@mapbox/mapbox-gl-draw";
+import type { Feature, MultiPolygon, Polygon } from "geojson";
 import ColumnMapper from "@/components/ColumnMapper";
 import DataPanel, { type Notice } from "@/components/DataPanel";
 import Legend from "@/components/Legend";
+import SelectionPanel, { type Selection } from "@/components/SelectionPanel";
 import { APP_NAME } from "@/lib/branding";
 import {
   detectMapping,
@@ -15,14 +18,21 @@ import {
   type MappingDraft,
 } from "@/lib/columns";
 import { parseQuakeCsv } from "@/lib/csv";
+import { countPointsInPolygon } from "@/lib/geo";
 import {
+  DRAW_STYLES,
+  EMPTY_COLLECTION,
   HEATMAP_LAYER_ID,
   LAYER_ID,
   MAP_INIT,
   QUAKE_CIRCLE_LAYER,
   QUAKE_HEATMAP_LAYER,
+  QUAKE_SELECTED_LAYER,
+  QUAKE_SELECTED_SOURCE,
   QUAKE_SOURCE,
   SAMPLE_CSV_PATH,
+  SELECTED_LAYER_ID,
+  SELECTED_SOURCE_ID,
   SOURCE_ID,
   type MapMode,
 } from "@/lib/mapbox";
@@ -60,8 +70,21 @@ export default function MapView() {
   // The map instance is a large mutable object — it lives in a ref, never in
   // state, so commanding it imperatively cannot trigger a re-render loop.
   const mapRef = useRef<mapboxgl.Map | null>(null);
+  // Draw is another large mutable object commanded imperatively, so it lives
+  // beside the map for the same reason (D3).
+  const drawRef = useRef<MapboxDraw | null>(null);
   // The parsed sample, kept so "reset to sample" costs no fetch and no reparse.
   const sampleRef = useRef<QuakeFeature[] | null>(null);
+  // Whatever is on the map right now — sample or upload. The polygon count is
+  // taken against this, so it has to be the same array the source was fed.
+  const featuresRef = useRef<QuakeFeature[]>([]);
+  // Mirrors `drawing` for the popup handler, which is wired once on load and
+  // so cannot see later renders' state.
+  const drawingRef = useRef(false);
+  // The features the ring layer was last fed. Kept so a frame that changed
+  // nothing does not pay to re-upload identical geometry — see the note in
+  // `refreshSelection`.
+  const ringedRef = useRef<QuakeFeature[]>([]);
 
   // All plain UI state. None of it holds anything the map owns, so none of it
   // can trigger the render loop D3 keeps the map instance out of.
@@ -72,6 +95,8 @@ export default function MapView() {
   const [notice, setNotice] = useState<Notice | null>(null);
   const [mapper, setMapper] = useState<MapperState | null>(null);
   const [busy, setBusy] = useState(false);
+  const [drawing, setDrawing] = useState(false);
+  const [selection, setSelection] = useState<Selection | null>(null);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -99,11 +124,61 @@ export default function MapView() {
       // hidden — the toggle only ever flips `visibility`.
       map.addLayer(QUAKE_HEATMAP_LAYER);
       map.addLayer(QUAKE_CIRCLE_LAYER);
-      wireInteractions(map);
+
+      // The selection ring is its own source and its own layer, added above
+      // the circles and fed only with whatever falls inside the polygon. It
+      // is additive on purpose: neither of the two layers below it changes,
+      // and with no polygon drawn its source is empty and it draws nothing.
+      map.addSource(SELECTED_SOURCE_ID, QUAKE_SELECTED_SOURCE);
+      map.addLayer(QUAKE_SELECTED_LAYER);
+
+      wireInteractions(map, drawingRef);
+      wireDrawing(map);
       if (cancelled) return;
       setLayersReady(true);
       void loadSample();
     });
+
+    /**
+     * Draw goes on last, so its outline and handles sit above every data
+     * layer. `displayControlsDefault: false` suppresses Draw's own button
+     * bar — it is a light-themed control that would land in a corner this
+     * layout has already spent (D26); the buttons in the right-hand stack
+     * drive it instead.
+     */
+    function wireDrawing(map: mapboxgl.Map) {
+      const draw = new MapboxDraw({
+        displayControlsDefault: false,
+        // Shift-drag stays the map's box zoom rather than becoming Draw's
+        // marquee select — there is only ever one shape to select.
+        boxSelect: false,
+        styles: DRAW_STYLES,
+      });
+      drawRef.current = draw;
+      map.addControl(draw);
+
+      // Every listener below is registered once and reads only refs and state
+      // setters, so it never goes stale against a later render.
+      //
+      // These three are the authoritative edges and are deliberately *not*
+      // mode-guarded. `draw.create` in particular fires from the outgoing
+      // mode's `onStop`, which Draw runs *before* it updates the mode name —
+      // so at that instant `getMode()` still says `draw_polygon`, and a
+      // guarded handler would drop the one count that matters most.
+      map.on("draw.create", refreshSelection);
+      map.on("draw.update", refreshSelection);
+      map.on("draw.delete", refreshSelection);
+
+      // And this is the continuous one, between those edges.
+      map.on("draw.render", refreshSelectionLive);
+
+      // Fired when Draw changes mode on its own — finishing a polygon, or
+      // Escape cancelling one. Asking Draw for its mode rather than reading
+      // the event keeps one answer to "are we drawing?".
+      map.on("draw.modechange", () => {
+        setDrawingMode(drawRef.current?.getMode() === "draw_polygon");
+      });
+    }
 
     async function loadSample() {
       try {
@@ -111,6 +186,7 @@ export default function MapView() {
         if (cancelled) return;
 
         sampleRef.current = features;
+        featuresRef.current = features;
         const source = map.getSource(SOURCE_ID) as GeoJSONSource | undefined;
         source?.setData({ type: "FeatureCollection", features });
 
@@ -133,8 +209,13 @@ export default function MapView() {
 
     return () => {
       cancelled = true;
+      // `map.remove()` calls every control's onRemove, which leaves Draw's
+      // internals torn down — so the ref is dropped in the same breath, or a
+      // late refresh would ask a gutted Draw for its features.
       map.remove();
       mapRef.current = null;
+      drawRef.current = null;
+      drawingRef.current = false;
     };
   }, []);
 
@@ -155,6 +236,17 @@ export default function MapView() {
       "visibility",
       mode === "heatmap" ? "visible" : "none",
     );
+
+    // The selection ring follows Points mode. The count is a fact about the
+    // data and holds in either mode, but a ring drawn around an individual
+    // quake is a claim Heatmap mode cannot make — see D25.
+    if (map.getLayer(SELECTED_LAYER_ID)) {
+      map.setLayoutProperty(
+        SELECTED_LAYER_ID,
+        "visibility",
+        mode === "points" ? "visible" : "none",
+      );
+    }
   }, [mode, layersReady]);
 
   /**
@@ -171,9 +263,128 @@ export default function MapView() {
     if (!map || !source) return false;
 
     source.setData({ type: "FeatureCollection", features });
+    featuresRef.current = features;
     setStats(computeStats(features));
+
+    // A polygon outlives the data it was drawn over: it is a question about a
+    // region, and the answer is simply recomputed against whatever is on the
+    // map now. Deleting the user's shape to tidy up the state would be the
+    // same mistake D18 refuses to make with the points themselves.
+    refreshSelection();
+
     if (options.fit) fitToFeatures(map, features);
     return true;
+  }
+
+  /**
+   * Recounts what is inside the drawn polygon and re-feeds the ring layer.
+   *
+   * Touches only refs and state setters, which is what lets the Draw
+   * listeners bind it once on load and never see a stale render.
+   */
+  function refreshSelection() {
+    const map = mapRef.current;
+    const polygon = drawnPolygon(drawRef.current);
+    const source = map?.getSource(SELECTED_SOURCE_ID) as
+      | GeoJSONSource
+      | undefined;
+
+    if (!polygon) {
+      if (ringedRef.current.length > 0) {
+        source?.setData(EMPTY_COLLECTION);
+        ringedRef.current = [];
+      }
+      setSelection(null);
+      return;
+    }
+
+    const features = featuresRef.current;
+    const { inside, insideFeatures } = countPointsInPolygon(features, polygon);
+
+    // Now that this runs per frame, the two writes below are the expensive
+    // part — the count itself is a fraction of a millisecond, but `setData`
+    // costs a worker round trip and a re-tile, and `setSelection` costs a
+    // React render. Most frames of a drag change neither: a vertex crossing
+    // empty ocean encloses exactly the same quakes it did last frame.
+    //
+    // So both are skipped when nothing changed. This is not throttling —
+    // every genuine change still lands on the frame it happened — it is
+    // declining to redo work with no effect. The identity comparison is
+    // sound because `insideFeatures` holds the very same objects in input
+    // order, which is a contract of `countPointsInPolygon` (D28).
+    if (!sameFeatures(insideFeatures, ringedRef.current)) {
+      source?.setData({ type: "FeatureCollection", features: insideFeatures });
+      ringedRef.current = insideFeatures;
+    }
+
+    setSelection((previous) =>
+      previous !== null &&
+      previous.inside === inside &&
+      previous.total === features.length
+        ? previous
+        : { inside, total: features.length },
+    );
+  }
+
+  /**
+   * The per-frame path, behind the one guard that matters.
+   *
+   * While a polygon is still being drawn its half-finished self is already in
+   * Draw's store, with a trailing vertex glued to the cursor — and asking for
+   * it back gives a *closed* ring regardless, because Draw's Polygon model
+   * closes every ring on the way out (`getCoordinates` concatenates the first
+   * position onto the end). So "is the ring closed?" cannot tell a finished
+   * shape from an unfinished one, and neither can "does it have enough
+   * corners": two clicks in, it has three. **The mode is the only thing that
+   * knows**, so the mode is the guard.
+   *
+   * Nothing downstream depends on this being the only line of defence —
+   * `drawnPolygon` still returns null when there is no polygon, and
+   * `countPointsInPolygon` still refuses to throw on a degenerate ring (D28).
+   * The guard is about not showing a number, not about safety.
+   */
+  function refreshSelectionLive() {
+    const draw = drawRef.current;
+    if (!draw) return;
+    if (draw.getMode() === MapboxDraw.constants.modes.DRAW_POLYGON) return;
+    refreshSelection();
+  }
+
+  /** Keeps the popup handler's copy of "are we drawing?" with the UI's. */
+  function setDrawingMode(next: boolean) {
+    drawingRef.current = next;
+    setDrawing(next);
+  }
+
+  function handleDraw() {
+    const draw = drawRef.current;
+    if (!draw) return;
+
+    if (drawingRef.current) {
+      draw.changeMode("simple_select");
+      setDrawingMode(false);
+      return;
+    }
+
+    // One shape at a time. Starting a new one replaces the old, which is why
+    // there is never a set of polygons to reconcile — `drawnPolygon` can take
+    // the first it finds.
+    draw.deleteAll();
+    refreshSelection();
+    draw.changeMode("draw_polygon");
+    setDrawingMode(true);
+  }
+
+  function handleClearSelection() {
+    const draw = drawRef.current;
+    if (!draw) return;
+
+    // Draw suppresses events for its own API calls, so `deleteAll` fires no
+    // `draw.delete` and the refresh below is the thing that updates the UI.
+    draw.deleteAll();
+    draw.changeMode("simple_select");
+    setDrawingMode(false);
+    refreshSelection();
   }
 
   /**
@@ -360,6 +571,12 @@ export default function MapView() {
           {layersReady && (
             <>
               <ModeToggle mode={mode} onChange={setMode} />
+              <SelectionPanel
+                drawing={drawing}
+                selection={selection}
+                onDraw={handleDraw}
+                onClear={handleClearSelection}
+              />
               <DataPanel
                 sourceLabel={sourceLabel(dataSource)}
                 busy={busy}
@@ -524,9 +741,55 @@ function ModeToggle({
   );
 }
 
+/**
+ * The one polygon on the map, or `null`. Only one can exist at a time —
+ * `handleDraw` clears before it starts — so the first is the only.
+ */
+function drawnPolygon(
+  draw: MapboxDraw | null,
+): Feature<Polygon | MultiPolygon> | null {
+  if (!draw) return null;
+
+  for (const feature of draw.getAll().features) {
+    const type = feature.geometry?.type;
+    if (type === "Polygon" || type === "MultiPolygon") {
+      return feature as Feature<Polygon | MultiPolygon>;
+    }
+  }
+  return null;
+}
+
+/**
+ * Whether two selections are the same features in the same order.
+ *
+ * Identity, not deep equality: `countPointsInPolygon` returns the very
+ * features it was given (D28), so two runs over the same data yield the same
+ * objects, and a reference comparison is both exact and free. 619 of them cost
+ * microseconds against the millisecond a needless `setData` would cost.
+ */
+function sameFeatures(
+  a: readonly QuakeFeature[],
+  b: readonly QuakeFeature[],
+): boolean {
+  if (a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) return false;
+  }
+  return true;
+}
+
 /** Click a point for its details; the cursor advertises that it is clickable. */
-function wireInteractions(map: mapboxgl.Map) {
+function wireInteractions(
+  map: mapboxgl.Map,
+  drawing: React.RefObject<boolean>,
+) {
   map.on("click", LAYER_ID, (event) => {
+    // While a shape is being drawn, a click on the map is a corner. Draw does
+    // not stop this layer's own handler from firing, so a click that landed
+    // on a quake would place a vertex *and* open a popup over the shape being
+    // drawn. Nothing about the popup itself changes — only when it opens.
+    if (drawing.current) return;
+
     const feature = event.features?.[0];
     if (!feature || feature.geometry.type !== "Point") return;
 
